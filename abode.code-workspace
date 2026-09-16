@@ -1,0 +1,12 @@
+{
+  "folders": [
+    { "path": "ai-service" },
+    { "path": "api" },
+    { "path": "frontend" }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "${workspaceFolder:ai-service}/.venv/bin/python",
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false
+  }
+}

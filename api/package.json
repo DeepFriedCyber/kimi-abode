@@ -1,0 +1,32 @@
+{
+  "name": "abode-api",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@fastify/jwt": "^8.0",
+    "@fastify/cors": "^9.0",
+    "fastify": "^4.28",
+    "socket.io": "^4.7",
+    "bcryptjs": "^2.4",
+    "argon2": "^0.40",
+    "pino": "^8.21"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4",
+    "@types/node": "^20.14",
+    "tsx": "^4.16",
+    "typescript": "^5.5",
+    "vitest": "^2.0",
+    "@types/better-sqlite3": "^7.6",
+    "socket.io-client": "^4.7"
+  }
+}
