@@ -14,8 +14,6 @@ class PoiPoint(NamedTuple):
     distance_m: float = 0.0
     decay_score: float = 0.0
 
-from math import atan2, cos, radians, sin, sqrt
-
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Distance in metres between two WGS84 coordinates."""

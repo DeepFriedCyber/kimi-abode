@@ -23,8 +23,12 @@ def qa_poi_data(pois: list[dict]) -> dict[str, Any]:
     uk_lat_min, uk_lon_min, uk_lat_max, uk_lon_max = 49.5, -10, 61, 2
 
     for i, poi in enumerate(pois):
-        # Check coordinates
-        lat, lon = poi.get("lat"), poi.get("lon")
+        # Check coordinates (guard against missing/null values)
+        lat = poi.get("lat")
+        lon = poi.get("lon")
+        if lat is None or lon is None:
+            results["issues"].append(f"POI {i}: missing coordinates")
+            continue
         if not (uk_lat_min <= lat <= uk_lat_max) or not (uk_lon_min <= lon <= uk_lon_max):
             results["issues"].append(f"POI {i}: coordinates out of UK bounds ({lat}, {lon})")
 

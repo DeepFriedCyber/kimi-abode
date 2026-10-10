@@ -103,12 +103,11 @@ class InMemorySemanticCache:
             self._store.move_to_end(key)
             return entry.result
 
-        # Slow path: semantic match — use hash bucket to narrow candidates
+        # Slow path: semantic match — compare against all surviving entries
         if not self._embedder:
             return None
 
         q_emb = await self._embedder.embed(query)
-        bucket = _hash_bucket(query, self._bucket_count)
 
         best_sim = 0.0
         best_key = None
@@ -116,9 +115,6 @@ class InMemorySemanticCache:
             if time.time() - entry.created_at > self.ttl_seconds:
                 continue
             if not entry.embedding:
-                continue
-            # Additional bucket check — only compare entries from same hash bucket
-            if _hash_bucket(entry.query, self._bucket_count) != bucket:
                 continue
             sim = _cosine_sim(q_emb, entry.embedding)
             if sim > best_sim:

@@ -18,7 +18,7 @@ async def run_embedding_worker(
     if not pool or not embedder:
         return 0
 
-    sql_fetch = "SELECT id, address_line1 FROM properties WHERE embedding IS NULL LIMIT %s"
+    sql_fetch = "SELECT id, address_line1 FROM properties WHERE embedding IS NULL LIMIT $1"
     sql_update = "UPDATE properties SET embedding = $1 WHERE id = $2"
 
     count = 0

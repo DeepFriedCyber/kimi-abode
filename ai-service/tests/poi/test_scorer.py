@@ -42,13 +42,16 @@ class TestPOIRouter:
     @pytest.mark.asyncio
     async def test_ingest_pois(self):
         from app.routers.poi import router, ingest_pois
-        import asyncio
+        from fastapi import Request
+        from unittest.mock import MagicMock
 
         # Clear existing data
         from app.routers.poi import set_poi_data
         set_poi_data([])
 
-        result = await ingest_pois({"bbox": "53.0,-2.7,53.3,-2.1"})
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        result = await ingest_pois({"bbox": "53.0,-2.7,53.3,-2.1"}, mock_request)
         assert isinstance(result, dict)
         assert "ingested" in result
 
@@ -101,12 +104,12 @@ class TestAuthRoutes:
         # This tests the conditional in api/src/app.ts
         assert True  # Placeholder — full test requires Fastify client setup
 
-
 class TestPasswords:
     """Tests for password hashing."""
 
     def test_password_hashing_is_deterministic_with_same_salt(self):
         import hashlib
+
         salt = "test-salt"
         pw1 = "password123"
         pw2 = "password123"
@@ -117,10 +120,11 @@ class TestPasswords:
 
     def test_different_passwords_have_different_hashes(self):
         import hashlib
-        salt = "test-salt"
-        h1 = hashlib.sha256(("pass1", salt).__class__.__name__ and (str(pw) + str(salt)).encode() for pw in ["pass1"]).pop() if False else ""
 
-        assert True  # Basic assertion
+        salt = "test-salt"
+        h1 = hashlib.sha256(("pass1" + salt).encode()).hexdigest()
+        h2 = hashlib.sha256(("pass2" + salt).encode()).hexdigest()
+        assert h1 != h2
 
 
 class TestObservabilityMetrics:

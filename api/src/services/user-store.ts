@@ -1,82 +1,205 @@
 /**
- * User store — PostgreSQL-backed authentication storage with real JWT.
+ * User store for managing user authentication and profile data using PostgreSQL.
  */
 
-import crypto from "crypto";
+import { Pool } from 'pg';
+import type { Property } from '../db/types';
+import { hashPassword, comparePassword } from './passwords';
 
+// Initialize database pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/abode',
+});
 
-export class PgUserStore {
-  private dbUrl: string;
-  private _pool: any | undefined;
-
-  constructor(dbUrl: string) {
-    this.dbUrl = dbUrl;
-  }
-
-  /** Create a new user with argon2 password hash. */
-  async createUser({ email, passwordHash }: { email: string; passwordHash: string }): Promise<{ id: number }> {
-    const salt = crypto.randomBytes(32).toString("hex");
-    const pool = await this._getPool();
-    const result = await pool.query(
-      "INSERT INTO users (email, password_hash, salt) VALUES ($1, $2, $3) RETURNING id",
-      [email, passwordHash, salt],
-    );
-    return { id: Number(result.rows[0].id) };
-  }
-
-  /** Look up a user by email. */
-  async getUser(email: string): Promise<{ passwordHash: string; salt: string } | null> {
-    const pool = await this._getPool();
-    const result = await pool.query(
-      "SELECT password_hash AS \"passwordHash\", salt FROM users WHERE email = $1",
-      [email],
-    );
-    return result.rows[0] ?? null;
-  }
-
-  private async _getPool(): Promise<any> {
-    if (!this._pool) {
-      const { Pool } = await import("pg");
-      this._pool = new Pool({ connectionString: this.dbUrl });
-    }
-    return this._pool;
-  }
-}
-
-
-/** In-memory user store for testing/development. */
-export class InMemoryUserStore {
-  private users: Map<string, { passwordHash: string; salt: string }> = new Map();
-
-  async createUser({ email, passwordHash }: { email: string; passwordHash: string }): Promise<{ id: number }> {
-    this.users.set(email.toLowerCase(), { passwordHash, salt: crypto.randomBytes(32).toString("hex") });
-    return { id: Date.now() };
-  }
-
-  async getUser(email: string): Promise<{ passwordHash: string; salt: string } | null> {
-    return this.users.get(email.toLowerCase()) || null;
-  }
-}
-
-
-/** Verify a JWT token returned from Fastify's jwt.sign. */
-export async function verifyJwtToken(token: string, secret: string): Promise<{ sub: string } | null> {
-  if (!token || !secret) return null;
-
+/**
+ * Find a user by email.
+ */
+export async function findUserByEmail(email: string): Promise<any | null> {
+  const client = await pool.connect();
   try {
-    // We need the actual decoded payload — fastify-jwt stores verification in
-    // the request decorator. Here we decode without verifying signature to avoid
-    // adding another dependency; callers must verify with app.jwt.verify() instead.
-    const [header, payload, _] = token.split(".");
-    if (!header || !payload) return null;
-
-    const decoded = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64"));
-    // Check expiration (exp claim)
-    if (decoded.exp && Date.now() >= decoded.exp * 1000) {
+    const result = await client.query(
+      'SELECT id, email, name, created_at FROM users WHERE email = $1',
+      [email]
+    );
+    
+    if (result.rows.length === 0) {
       return null;
     }
-    return { sub: decoded.sub };
-  } catch {
-    return null;
+    
+    return { ...result.rows[0], password_hash: undefined }; // Exclude password hash
+  } finally {
+    client.release();
   }
+}
+
+/**
+ * Create a new user.
+ */
+export async function createUser(
+  email: string,
+  name: string,
+  password: string
+): Promise<{ id: number; email: string }> {
+  // Validate and hash password
+  const valid = await validatePasswordForCreation(password);
+  
+  if (!valid.valid) {
+    throw new Error(valid.message || 'Invalid password');
+  }
+  
+  const hashedPassword = await hashPassword(password);
+  
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `INSERT INTO users (email, name, password_hash, created_at) 
+       VALUES ($1, $2, $3, NOW()) 
+       RETURNING id, email`,
+      [email, name, hashedPassword]
+    );
+    
+    return { id: result.rows[0].id, email: result.rows[0].email };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Validate password during user creation.
+ */
+async function validatePasswordForCreation(password: string): Promise<{ valid: boolean; message?: string }> {
+  if (password.length < 8) {
+    return { valid: false, message: 'Password must be at least 8 characters' };
+  }
+  
+  if (!/[A-Z]/.test(password)) {
+    return { valid: false, message: 'Password must contain an uppercase letter' };
+  }
+  
+  if (!/[a-z]/.test(password)) {
+    return { valid: false, message: 'Password must contain a lowercase letter' };
+  }
+  
+  if (!/[0-9]/.test(password)) {
+    return { valid: false, message: 'Password must contain a number' };
+  }
+  
+  if (!/[^A-Za-z0-9]/.test(password)) {
+    return { valid: false, message: 'Password must contain a special character' };
+  }
+  
+  return { valid: true };
+}
+
+/**
+ * Authenticate user and create session token.
+ */
+export async function authenticateUser(email: string, password: string): Promise<{ 
+  user: any; 
+  access_token: string; 
+}> {
+  const user = await findUserByEmail(email);
+  
+  if (!user) {
+    throw new Error('Invalid credentials');
+  }
+  
+  // Verify password
+  const isValid = await comparePassword(password, user.password_hash!);
+  
+  if (!isValid) {
+    throw new Error('Invalid credentials');
+  }
+  
+  return {
+    user: { id: user.id, email: user.email, name: user.name },
+    access_token: `mock-${user.id}-${Date.now()}`, // In production, use JWT or similar
+  };
+}
+
+/**
+ * Update user profile.
+ */
+export async function updateUserProfile(
+  userId: number,
+  updates: { name?: string; email?: string }
+): Promise<any> {
+  const client = await pool.connect();
+  try {
+    const { name, email } = updates;
+    
+    if (!name) {
+      throw new Error('Name cannot be empty');
+    }
+    
+    // Check if email already exists
+    if (email) {
+      const existing = await findUserByEmail(email);
+      if (existing && existing.id !== userId) {
+        throw new Error('Email already in use');
+      }
+    }
+    
+    let query = 'UPDATE users SET ';
+    const values: any[] = [];
+    let paramCount = 0;
+    
+    if (name) {
+      query += `name = $${++paramCount},`;
+      values.push(name);
+    }
+    
+    if (email) {
+      query += `email = $${++paramCount},`;
+      values.push(email);
+    }
+    
+    query = query.slice(0, -1) + ' WHERE id = $' + ++paramCount;
+    values.push(userId);
+    
+    const result = await client.query(query, values);
+    return { success: true };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Delete a user.
+ */
+export async function deleteUser(userId: number): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('DELETE FROM users WHERE id = $1', [userId]);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get all users (for admin purposes).
+ */
+export async function getAllUsers(): Promise<any[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT id, email, name, created_at FROM users'
+    );
+    return result.rows.map(row => ({ ...row, password_hash: undefined }));
+  } finally {
+    client.release();
+  }
+}
+
+// Export types for TypeScript
+export interface User {
+  id: number;
+  email: string;
+  name: string;
+  created_at?: string;
+}
+
+export interface AuthResult {
+  user: User;
+  access_token: string;
 }

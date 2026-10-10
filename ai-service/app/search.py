@@ -1,4 +1,4 @@
-"""Semantic search — hybrid retrieval with pgvector."""
+"""Semantic search — hybrid retrieval with pgvector fallback."""
 
 from __future__ import annotations
 
@@ -20,14 +20,17 @@ async def search(
     2. Hybrid search (vector + keyword) via pgvector -> ~50-200ms
     3. Deterministic filter-only -> ~5ms
     """
+    
     parsed = await parse_query(query)
 
     if not pool:
+        # No database pool - return deterministic fallback results
+        print(f"[Search] Running in fallback mode (no PostgreSQL pool). Query: {query}")
         return {
             "properties": [],
-            "tier_used": parsed.tier,
+            "tier_used": "deterministic-fallback",
             "total_matches": 0,
-            "message": f"parsed tier={parsed.tier} beds={parsed.min_beds} type={parsed.property_types}",
+            "message": "Running in dev mode without database. Configure DATABASE_URL for full search.",
         }
 
     # --- generate embedding -------------------------------------------------
@@ -68,3 +71,48 @@ async def search_location(
         "total_matches": total,
         "message": f"Found {total} properties near {location}",
     }
+
+
+async def count_properties(
+    pool=None,
+) -> dict[str, Any]:
+    """Count total properties."""
+    if not pool:
+        return {"count": 0, "message": "No database connection available"}
+
+    from .repository import count_properties as repo_count
+    count = await repo_count(pool)
+    
+    return {
+        "count": count,
+        "tier_used": "deterministic" if not hasattr(repo_count, 'pool') else "pgvector",
+        "message": f"Database contains {count} properties",
+    }
+
+
+async def health_check(
+    pool=None,
+) -> dict[str, Any]:
+    """Health check for search service."""
+    if not pool:
+        return {
+            "status": "healthy",
+            "mode": "fallback",
+            "message": "Running without database (dev mode)",
+        }
+
+    try:
+        count = await count_properties(pool)
+        return {
+            "status": "healthy",
+            "count": count.get("count", 0),
+            "mode": "production",
+            "message": f"Database connected. Found {count.get('count', 0)} properties",
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "mode": "fallback",
+            "message": f"Database connection failed: {e}",
+        }

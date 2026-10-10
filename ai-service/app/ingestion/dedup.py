@@ -107,18 +107,20 @@ def _number_conflict(addr1: str, addr2: str) -> bool:
 
 
 def _longest_common_substring(a: str, b: str) -> str:
-    """Find the longest common substring (efficient enough for addresses)."""
+    """Find the longest common substring between two strings."""
     if not a or not b:
         return ""
     m = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
     longest = 0
+    end_pos = 0
     for i in range(1, len(a) + 1):
         for j in range(1, len(b) + 1):
             if a[i - 1] == b[j - 1]:
                 m[i][j] = m[i - 1][j - 1] + 1
                 if m[i][j] > longest:
                     longest = m[i][j]
-    return a[max(0, i - longest):i]
+                    end_pos = i
+    return a[end_pos - longest : end_pos]
 
 
 def _completeness_score(item: dict[str, Any]) -> int:

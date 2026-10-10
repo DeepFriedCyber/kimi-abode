@@ -1,88 +1,58 @@
-/**
- * Ask routes — POI queries, property location intelligence.
- */
-
-import type { FastifyPluginCallback } from "fastify";
-
-
-// ---- typed request bodies ---------------------------------------------------
-
-interface SearchQuery {
-  q?: string;
-  min_beds?: string;
-  max_price?: string;
-  location?: string;
-  outcode?: string;
-  district?: string;
-}
-
-interface PoiBody {
-  lat?: number;
-  lon?: number;
-  category?: string;
-  radius?: number;
-}
-
-interface AskSearchBody {
-  query?: string;
-}
-
-
-// ---- rate limiter (per-route) -----------------------------------------------
-
-function createRouteLimiter(maxPerMinute: number): () => boolean {
-  const entries: [number, number][] = []; // [timestamp, count]
-  return function check(): boolean {
-    const now = Date.now();
-    // Remove expired entries
-    while (entries.length > 0 && now - entries[0][0] > 60_000) {
-      entries.shift();
-    }
-    if (entries.length === 0) {
-      entries.push([now, 1]);
-      return true;
-    }
-    const latest = entries[entries.length - 1];
-    if (now - latest[0] > 60_000) {
-      entries.push([now, 1]);
-      return true;
-    }
-    if (latest[1] >= maxPerMinute) return false;
-    latest[1]++;
-    return true;
-  };
-}
-
-const searchLimiter = createRouteLimiter(30);
-const askSearchLimiter = createRouteLimiter(20);
-
+import fastify from "fastify";
+import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 
 // ---- routes -----------------------------------------------------------------
 
-export const askRoutes: FastifyPluginCallback<string> = async (app, aiUrl) => {
-  // Health check — no rate limit needed
-  app.get("/ask/health", async () => ({ status: "ok" }));
+export const askRoutes = async (app: FastifyInstance, opts: any) => {
+  const aiUrl = opts.aiUrl;
+
+  // Proxy to AI service parse endpoint (for frontend /api/parse)
+  app.post("/parse", async function (req, reply) {
+    try {
+      const res = await fetch(`${aiUrl}/parse`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req.body),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return reply.code(502).send({ error: "AI parse service failed" });
+      return res.json();
+    } catch {
+      return reply.code(502).send({ error: "AI service unavailable" });
+    }
+  });
+
+  // Proxy to AI service chat endpoint (for frontend /api/chat)
+  app.post("/chat", async function (req, reply) {
+    try {
+      const res = await fetch(`${aiUrl}/chat/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req.body),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) return reply.code(502).send({ error: "AI chat service failed" });
+      return res.json();
+    } catch {
+      return reply.code(502).send({ error: "AI service unavailable" });
+    }
+  });
 
   // GET /api/search — frontend search endpoint (proxy to AI service)
-  app.get<{ Querystring: SearchQuery }>("/search", async (req, reply) => {
-    const query = req.query as SearchQuery;
+  app.get("/search", async function (req, reply) {
+    const query = req.query as Record<string, unknown>;
 
-    if (!query.q || query.q.trim().length < 2) {
+    if (!query.q || typeof query.q !== "string" || query.q.trim().length < 2) {
       return reply.code(400).send({ error: "q parameter must be at least 2 characters" });
     }
 
-    // Rate limit to prevent API abuse
-    if (!searchLimiter()) {
-      return reply.code(429).send({ error: "too many search requests; try again later" });
-    }
-
     const params = new URLSearchParams();
-    params.set("query", query.q.trim());
-    if (query.min_beds) params.set("min_beds", query.min_beds);
-    if (query.max_price) params.set("max_price", query.max_price);
-    if (query.location) params.set("location", query.location);
-    if (query.outcode) params.set("outcode", query.outcode);
-    if (query.district) params.set("district", query.district);
+    params.set("query", String(query.q).trim());
+    if (typeof query.min_beds === "number") params.set("min_beds", String(query.min_beds));
+    if (typeof query.max_price === "number") params.set("max_price", String(query.max_price));
+    if (typeof query.location === "string") params.set("location", query.location);
+    if (typeof query.outcode === "string") params.set("outcode", query.outcode);
+    if (typeof query.district === "string") params.set("district", query.district);
 
     try {
       const res = await fetch(`${aiUrl}/search?${params.toString()}`, { signal: AbortSignal.timeout(10_000) });
@@ -94,22 +64,27 @@ export const askRoutes: FastifyPluginCallback<string> = async (app, aiUrl) => {
   });
 
   // POI query
-  app.post<{ Body: PoiBody }>("/ask/poi", async (req, reply) => {
-    const { lat, lon, category, radius }: PoiBody = req.body;
+  app.post("/ask/poi", async function (req, reply) {
+    const body = req.body as Record<string, unknown>;
 
-    if (lat == null || lon == null) {
+    const lat = Number(body.lat);
+    const lon = Number(body.lon);
+
+    if (Number.isNaN(lat) || Number.isNaN(lon)) {
       return reply.code(400).send({ error: "lat and lon are required" });
     }
     if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-      return reply.code(400).send({ error: "lat/lon out of valid range" });
+        return reply.code(400).send({ error: "lat/lon out of valid range" });
     }
 
     const queryStr = new URLSearchParams({ lat: String(lat), lon: String(lon) });
-    if (category) queryStr.set("category", category);
-    if (radius && radius > 0) queryStr.set("radius", String(radius));
+    if (typeof body.category === "string") queryStr.set("category", String(body.category));
+    if (typeof body.radius === "number" && body.radius > 0) queryStr.set("radius", String(body.radius));
+    if (typeof body.n === "number" && body.n > 0) queryStr.set("n", String(body.n));
 
     try {
       const res = await fetch(`${aiUrl}/poi/nearby?${queryStr}`, { signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) return reply.code(502).send({ error: "AI service returned an error" });
       return res.json();
     } catch {
       return reply.code(502).send({ error: "AI service unavailable" });
@@ -117,16 +92,12 @@ export const askRoutes: FastifyPluginCallback<string> = async (app, aiUrl) => {
   });
 
   // Property search via AI service — uses parsed fields + DB filter
-  app.post<{ Body: AskSearchBody }>("/ask/search", async (req, reply) => {
-    const { query }: AskSearchBody = req.body;
+  app.post("/ask/search", async function (req, reply) {
+    const body = req.body as Record<string, unknown>;
+    const query = typeof body.query === "string" ? body.query : String(body.query);
 
     if (!query || query.trim().length < 2) {
       return reply.code(400).send({ error: "query must be at least 2 characters" });
-    }
-
-    // Rate limit to prevent abuse (this is a double-hop request, costs more)
-    if (!askSearchLimiter()) {
-      return reply.code(429).send({ error: "too many ask/search requests; try again later" });
     }
 
     try {
@@ -147,20 +118,38 @@ export const askRoutes: FastifyPluginCallback<string> = async (app, aiUrl) => {
       // Now do the actual search with those fields
       const params = new URLSearchParams();
       params.set("query", query);
-      if (parsed.min_beds) params.set("min_beds", String(parsed.min_beds));
-      if (parsed.max_price) params.set("max_price", String(parsed.max_price));
-      if (parsed.location) params.set("location", parsed.location);
-      if (parsed.outcode) params.set("outcode", parsed.outcode);
-      if (parsed.district) params.set("district", parsed.district);
+      if (typeof parsed.min_beds === "number") params.set("min_beds", String(parsed.min_beds));
+      if (typeof parsed.max_price === "number") params.set("max_price", String(parsed.max_price));
+      if (typeof parsed.location === "string") params.set("location", parsed.location);
+      if (typeof parsed.outcode === "string") params.set("outcode", parsed.outcode);
+      if (typeof parsed.district === "string") params.set("district", parsed.district);
 
       const types = parsed.property_types;
       if (Array.isArray(types)) {
         for (const t of types) {
-          params.append("types", String(t));
+          if (typeof t === "string") params.append("types", t);
         }
       }
 
       const res = await fetch(`${aiUrl}/search?${params.toString()}`, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) return reply.code(502).send({ error: "AI service returned an error" });
+      return res.json();
+    } catch {
+      return reply.code(502).send({ error: "AI service unavailable" });
+    }
+  });
+
+  // GET /api/property/:id — fetch a single property by ID
+  app.get("/property/:id", async function (req: any, reply) {
+    const id = parseInt((req as any).params?.id || "0", 10);
+    if (isNaN(id) || id < 0) {
+      return reply.code(400).send({ error: "Invalid property id" });
+    }
+
+    try {
+      const params = new URLSearchParams({ id: String(id) });
+      const res = await fetch(`${aiUrl}/property?${params.toString()}`, { signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) return reply.code(502).send({ error: "AI service returned an error" });
       return res.json();
     } catch {
       return reply.code(502).send({ error: "AI service unavailable" });
