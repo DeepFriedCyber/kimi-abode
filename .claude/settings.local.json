@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//cygdrive/c/Users/aps33/.claude/projects/C--Users-aps33-Projects-Kimi-Abode/**)",
+      "Read(//cygdrive/c/Users/aps33/.claude/projects/C--Users-aps33-Projects-Kimi-Abode/memory/**)"
+    ]
+  }
+}

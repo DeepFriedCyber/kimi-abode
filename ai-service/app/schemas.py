@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -28,13 +27,13 @@ class ParsedQuery(BaseModel):
     """Result of parsing a natural-language property query."""
 
     tier: str  # deterministic | llm-1 | llm-2 | semantic-cache | forced-deterministic
-    min_beds: Optional[int] = None
-    max_price: Optional[float] = None
+    min_beds: int | None = None
+    max_price: float | None = None
     property_types: list[PropertyType] = Field(default_factory=list)
-    location: Optional[str] = None
-    district: Optional[str] = None
-    outcode: Optional[str] = None
-    semantic_remainder: Optional[str] = None
+    location: str | None = None
+    district: str | None = None
+    outcode: str | None = None
+    semantic_remainder: str | None = None
     has_location: bool = False
     has_price: bool = False
     raw: str
@@ -46,19 +45,19 @@ class ParseRequest(BaseModel):
 
 # ------------------------------------------------------------------ Property
 class Property(BaseModel):
-    id: Optional[int] = None
+    id: int | None = None
     address_line1: str
-    address_line2: Optional[str] = None
-    town: Optional[str] = None
-    postcode: Optional[str] = None
-    outcode: Optional[str] = None
+    address_line2: str | None = None
+    town: str | None = None
+    postcode: str | None = None
+    outcode: str | None = None
     property_type: PropertyType | None = None
-    num_beds: Optional[int] = None
-    price_paid: Optional[float] = None
-    date_sold: Optional[datetime] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    embedding: Optional[list[float]] = None  # OpenAI/Hash embedding
+    num_beds: int | None = None
+    price_paid: float | None = None
+    date_sold: datetime | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    embedding: list[float] | None = None
     source: str = "land-registry"
 
 
@@ -86,7 +85,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
-    property_id: Optional[int] = None
+    property_id: int | None = None
 
 
 class ChatResponse(BaseModel):

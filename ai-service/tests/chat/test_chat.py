@@ -10,9 +10,9 @@ class TestChatService:
 
     @pytest.mark.asyncio
     async def test_chat_stream(self):
-        from app.chat.service import ChatService, _NoLLM
+        from app.chat.service import ChatService, ChatFallbackLLM
 
-        llm = _NoLLM()
+        llm = ChatFallbackLLM()
         service = ChatService(llm)
 
         response = await service.chat("What is the stamp duty on £300k?")
@@ -25,17 +25,23 @@ class TestChatRouter:
 
     @pytest.mark.asyncio
     async def test_chat_endpoint_not_ready(self):
-        from app.routers.chat import set_chat_service, chat_endpoint
+        from app.routers.chat import chat_endpoint, _chat_service
+        import app.routers.chat as chat_mod
 
-        # Uninitialised — should raise 503
+        # Ensure module-level service is cleared for this test
+        chat_mod._chat_service = None
+
+        mock_request = type("R", (), {"app": type("A", (), {"state": type("S", (), {})()})()})()
+        # When no service is set, the resolver should raise HTTPException(503)
         with pytest.raises(Exception):  # 503 HTTPException
-            await chat_endpoint({"messages": [{"role": "user", "content": "hi"}]})
+            await chat_endpoint({"messages": [{"role": "user", "content": "hi"}]}, mock_request)
 
     def test_set_chat_service(self):
-        from app.routers.chat import set_chat_service, _chat_service
-        from app.chat.service import ChatService, _NoLLM
+        from app.routers.chat import set_chat_service
+        import app.routers.chat as chat_mod
+        from app.chat.service import ChatService, ChatFallbackLLM
 
-        llm = _NoLLM()
+        llm = ChatFallbackLLM()
         service = ChatService(llm)
         set_chat_service(service)
-        # After setting, _chat_service should be available
+        assert chat_mod._chat_service is service

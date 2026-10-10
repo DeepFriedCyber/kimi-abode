@@ -6,6 +6,31 @@ import asyncio
 import os
 
 
+def build_summary(
+    total_properties: int,
+    with_town: int,
+    with_geo: int,
+    unique_towns: int,
+    total_sales: int,
+    with_price: int,
+    trapped_pairs: list[tuple[str, str, str]],
+) -> dict:
+    """Build a structured summary from raw DB stats (testable without a database).
+
+    Returns a dict conforming to the EnrichmentReview schema.
+    """
+    pct = lambda got, total: round(got / max(total, 1) * 100, 1)
+    return {
+        "total_properties": total_properties,
+        "total_sales": total_sales,
+        "trapped_pairs": trapped_pairs,
+        "town_coverage_pct": pct(with_town, total_properties),
+        "geo_coverage_pct": pct(with_geo, total_properties),
+        "unique_towns": unique_towns,
+        "sales_with_price_pct": pct(with_price, total_sales),
+    }
+
+
 async def main():
     """Generate and print a review report of the current database state."""
     import asyncpg
@@ -14,7 +39,6 @@ async def main():
     pool = await asyncpg.create_pool(url)
 
     try:
-        # Properties summary
         prop_stats = await pool.fetchrow("""
             SELECT
                 count(*) as total,
@@ -24,10 +48,10 @@ async def main():
             FROM properties
         """)
 
-        # Sales summary
-        sales_stats = await pool.fetchrow("SELECT count(*) as total, count(price_paid) as with_price FROM sales")
+        sales_stats = await pool.fetchrow(
+            "SELECT count(*) as total, count(price_paid) as with_price FROM sales"
+        )
 
-        # Duplicate sale pairs (potential traps)
         trap_pairs = await pool.fetch("""
             SELECT property_address, town, postcode
             FROM sales
@@ -35,7 +59,6 @@ async def main():
             HAVING count(*) > 1
         """)
 
-        # Property type distribution
         type_dist = await pool.fetch("""
             SELECT property_type, count(*) as cnt
             FROM properties
@@ -44,16 +67,27 @@ async def main():
             ORDER BY cnt DESC
         """)
 
-        print("\n=== Enrichment Review Report ===\n")
-        print(f"Properties: {prop_stats['total']} total, "
-              f"{prop_stats['with_town']} with town ({round(prop_stats['with_town']/max(prop_stats['total'],1)*100,1)}%), "
-              f"{prop_stats['with_geo']} with geo ({round(prop_stats['with_geo']/max(prop_stats['total'],1)*100,1)}%), "
-              f"{prop_stats['unique_towns']} unique towns")
+        summary = build_summary(
+            total_properties=prop_stats["total"],
+            with_town=prop_stats["with_town"],
+            with_geo=prop_stats["with_geo"],
+            unique_towns=prop_stats["unique_towns"],
+            total_sales=sales_stats["total"],
+            with_price=sales_stats["with_price"],
+            trapped_pairs=[(t["property_address"], t["town"], t["postcode"]) for t in trap_pairs],
+        )
 
-        print(f"\nSales: {sales_stats['total']} total, {sales_stats['with_price']} with price")
-        print(f"Trapped pairs (multiple entries same address): {len(trap_pairs)}")
-        for t in trap_pairs[:10]:
-            print(f"  → {t['property_address']}, {t['town']}, {t['postcode']}")
+        print("\n=== Enrichment Review Report ===\n")
+        print(
+            f"Properties: {summary['total_properties']} total, "
+            f"{summary['town_coverage_pct']}% with town, "
+            f"{summary['geo_coverage_pct']}% with geo, "
+            f"{summary['unique_towns']} unique towns"
+        )
+        print(f"\nSales: {summary['total_sales']} total, {summary['sales_with_price_pct']}% with price")
+        print(f"Trapped pairs (multiple entries same address): {len(summary['trapped_pairs'])}")
+        for t in summary["trapped_pairs"][:10]:
+            print(f"  → {t[0]}, {t[1]}, {t[2]}")
 
         print("\nProperty type distribution:")
         for td in type_dist:

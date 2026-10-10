@@ -1,4 +1,3 @@
-import { validateConfig } from "./validate";
+import { validateConfig } from "./index";
 
-// Re-export config for convenience
-export { config } from "./index";
+export { validateConfig };

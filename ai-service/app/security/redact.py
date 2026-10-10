@@ -7,10 +7,10 @@ import re
 
 # Patterns for sensitive data types
 SENSITIVE_PATTERNS = [
-    (re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"), "CREDIT_CARD"),  # credit card
+    (re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"), "CREDIT_CARD"),
     (re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I), "EMAIL"),
-    (re.compile(r"Bearer\s+\S+"), "AUTH_TOKEN"),
-    (re.compile(r"(?i)(api[_-]?key|secret_key)\s+(?:is\s+)?\S{8,}", re.I), "SECRET"),  # API key <value>
+    (re.compile(r"Bearer\s+\S+", re.I), "AUTH_TOKEN"),
+    (re.compile(r"(api[_-]?key|secret_key)\s+is\s+\S{8,}", re.I), "SECRET"),
     (re.compile(r"(api[_-]?key|secret|password)\s*[:=]\s*\S+", re.I), "API_KEY"),
 ]
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 class Metrics:
@@ -11,7 +11,7 @@ class Metrics:
 
     def __init__(self):
         self._requests: dict[str, int] = defaultdict(int)
-        self._latencies: dict[str, list[float]] = defaultdict(list)
+        self._latencies: dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
 
     def inc(self, name: str, amount: int = 1):
         self._requests[name] += amount
@@ -22,7 +22,8 @@ class Metrics:
     def render(self) -> str:
         lines = ["# Abode AI Metrics\n"]
         for name, count in sorted(self._requests.items()):
-            avg = sum(self._latencies.get(name, [0])) / max(len(self._latencies.get(name, [1])), 1)
+            latencies = self._latencies.get(name)
+            avg = sum(latencies) / len(latencies) if latencies else 0.0
             lines.append(f"abode_{name}_total {{count={count}, avg_latency_ms={avg:.1f}}}\n")
         return "\n".join(lines)
 

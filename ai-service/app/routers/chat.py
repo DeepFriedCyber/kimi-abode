@@ -7,10 +7,23 @@ from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 
+# ------------------------------------------------------------------ chat service
+# Module-level fallback so tests can inject a service without an app instance.
+# In production, the service is set during lifespan and resolved from app.state.
+_chat_service: "ChatService | None" = None
+
+
+def set_chat_service(svc: "ChatService") -> None:
+    """Inject a ChatService at module level (used by tests and main.py)."""
+    global _chat_service
+    _chat_service = svc
+
 
 def _get_chat_service(request: Request):
-    """Resolve the chat service from FastAPI app state (avoids global mutation)."""
-    chat_svc = request.app.state.get("chat_service")
+    """Resolve the chat service, checking app state first then module-level fallback."""
+    chat_svc = getattr(request.app.state, "chat_service", None)
+    if chat_svc is None:
+        chat_svc = _chat_service
     if not chat_svc:
         raise HTTPException(status_code=503, detail="Chat service not initialised")
     return chat_svc

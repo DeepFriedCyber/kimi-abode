@@ -2,7 +2,7 @@
  * Tests for the SSE chat handler.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 describe("chat handler (SSE bridge)", () => {
   it("forwards messages to AI service", async () => {

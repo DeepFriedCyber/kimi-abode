@@ -81,11 +81,15 @@ def _deterministic_parse(query: str) -> ParsedQuery:
     has_price = False
     if pm:
         raw_val = pm.group(1).replace(",", "")
-        k_or_m = q_lower[pm.start():pm.end()].lower()
-        if "k" in k_or_m or "m" in k_or_m:
-            max_price = float(raw_val.replace("k", "").replace("K", "")) * 1000
-        else:
-            max_price = float(raw_val)
+        # Check for k/m suffix directly on the full matched text
+        multiplier = 1.0
+        match_text = pm.group(0).lower()
+        if match_text.endswith("k"):
+            multiplier = 1000
+        elif match_text.endswith("m"):
+            multiplier = 1_000_000
+
+        max_price = float(raw_val) * multiplier
         has_price = True
 
     # --- property types (compound-aware; longest match wins, skip subsumed) --

@@ -29,7 +29,7 @@ class ChatService:
         user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         if self.cache:
             cached = await self.cache.get(user_msg)
-            if cached and cached.get("hit_count", 0) > 0:
+            if cached:
                 yield cached["response"]
                 return
 

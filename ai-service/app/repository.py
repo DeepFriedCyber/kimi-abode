@@ -102,25 +102,24 @@ async def execute_search_pg(
     """
     where_sql, params = _build_where_clause(parsed, district)
 
-    # Reserve parameter index: LIMIT gets the next numbered placeholder
-    limit_param_idx = len(params) + 1
-    params.append(limit)
-
-    base_sql = (
-        f"SELECT *, (embedding IS NOT NULL)::int as has_embedding "
-        f"FROM properties WHERE {where_sql} LIMIT ${limit_param_idx}"
-    )
-
     if embedding:
-        vec_str = f"[{','.join(f'{v:.6f}' for v in embedding)}]"
-        # The LIMIT param index won't change since we already fixed it above
+        emb_str = f"[{','.join(f'{v:.6f}' for v in embedding)}]"
+        params.append(emb_str)
+        emb_idx = len(params)
         sql = (
             f"SELECT *, (embedding IS NOT NULL)::int as has_embedding "
             f"FROM properties WHERE {where_sql} "
-            f"ORDER BY embedding <=> '{vec_str}'::vector "
-            f"LIMIT ${limit_param_idx}"
+            f"ORDER BY embedding <=> ${emb_idx}::vector "
+            f"LIMIT ${emb_idx + 1}"
         )
+        params.append(limit)
     else:
+        limit_param_idx = len(params) + 1
+        params.append(limit)
+        base_sql = (
+            f"SELECT *, (embedding IS NOT NULL)::int as has_embedding "
+            f"FROM properties WHERE {where_sql} LIMIT ${limit_param_idx}"
+        )
         sql = base_sql
 
     async with pool.acquire() as conn:
@@ -138,3 +137,15 @@ async def count_properties(pool: asyncpg.Pool) -> int:
 async def count_sales(pool: asyncpg.Pool) -> int:
     async with pool.acquire() as conn:
         return await conn.fetchval("SELECT count(*) FROM sales")
+
+
+# ------------------------------------------------------------------ Fetch single property
+async def fetch_property_by_id(pool: asyncpg.Pool, prop_id: int) -> asyncpg.Record | None:
+    """Fetch a single property by ID."""
+    sql = (
+        "SELECT id, address_line1, address_line2, town, postcode, outcode, "
+        "property_type, num_beds, price_paid, date_sold, latitude, longitude "
+        "FROM properties WHERE id = $1"
+    )
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(sql, prop_id)

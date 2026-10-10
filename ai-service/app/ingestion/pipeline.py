@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, Awaitable, Callable
 
 from .formats import parse_blm_csv, parse_csv
 from .transform import transform_listing
@@ -66,14 +67,20 @@ class IngestionPipeline:
 
 async def persist_listings(
     listings: list[dict[str, Any]],
-    upsert_fn,
+    upsert_fn: Callable[[dict[str, Any]], Awaitable[Any]],
     batch_size: int = 100,
+    concurrency: int = 10,
 ) -> int:
-    """Persist listings in batches. Caller provides the async upsert function."""
+    """Persist listings in batches with bounded concurrency."""
     count = 0
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _upsert_one(listing: dict[str, Any]) -> None:
+        async with sem:
+            await upsert_fn(listing)
+
     for i in range(0, len(listings), batch_size):
         batch = listings[i : i + batch_size]
-        for listing in batch:
-            await upsert_fn(listing)
-            count += 1
+        await asyncio.gather(*[_upsert_one(l) for l in batch])
+        count += len(batch)
     return count

@@ -1,82 +1,49 @@
 /**
- * WebSocket bridge — forwards Socket.io connections to SSE streams from the AI service.
- * Keeps a single connection to the FastAPI backend per client session.
+ * Socket.IO WebSocket Handler for real-time chat functionality.
  */
 
-import { Server as HttpServer } from "http";
-import { Server as SocketIOServer, Socket } from "socket.io";
+import { Server } from 'socket.io';
+import type http from 'http';
 
-export function attachChatSocket(
-  app: any,
-  opts: { aiUrl: string; corsOrigin: string },
-) {
-  const io = new SocketIOServer({
-    cors: { origin: opts.corsOrigin },
-  });
+// Create HTTP server (needed for Socket.IO to bind)
+let httpServer: http.Server | null = null;
 
-  // Attach to Fastify's underlying HTTP server
-  const server = (app.server as HttpServer);
-  if (server) {
-    io.attach(server);
-  }
+export function attachChatSocket(ioServer: Server, opts?: { corsOrigin?: string; }) {
+  console.log("[SocketIO] Initializing WebSocket handler");
+  
+  // Configure CORS directly via ioServer.attach or use HTTP server options
+  const corsOrigin = opts?.corsOrigin || process.env.FRONTEND_URL || '*';
 
-  io.on("connection", (socket: Socket) => {
-    console.log("Chat socket connected:", socket.id);
+  // Handle socket connections
+  ioServer.on('connection', (socket) => {
+    console.log(`[SocketIO] User connected: ${socket.id}`);
 
-    let abortController: AbortController | null = null;
-
-    socket.on("chat:message", async (data: { messages: Array<{ role: string; content: string }> }) => {
-      abortController = new AbortController();
-      try {
-        // Forward to AI service via SSE stream
-        const res = await fetch(`${opts.aiUrl}/chat/chat/stream`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data),
-          signal: abortController?.signal,
-        });
-
-        if (!res.body) {
-          socket.emit("chat:error", { message: "No response from AI service" });
-          return;
-        }
-
-        // Stream chunks back to the client
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          // Parse SSE lines
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const dataStr = line.slice(6).trim();
-              if (dataStr) {
-                socket.emit("chat:response", { chunk: dataStr });
-              }
-            }
-          }
-        }
-
-        // Send final marker
-        socket.emit("chat:done");
-      } catch (err) {
-        socket.emit("chat:error", { message: String(err) });
-      }
+    // Join room
+    socket.on('join-room', (data: { roomId: string }) => {
+      const { roomId } = data;
+      socket.join(roomId);
+      console.log(`[SocketIO] Socket ${socket.id} joined room "${roomId}"`);
     });
 
-    socket.on("disconnect", () => {
-      if (abortController) abortController.abort();
+    // Send message
+    socket.on('send-message', (data: { roomId: string; text: string }) => {
+      const { roomId, text } = data;
+      ioServer.to(roomId).emit('receive-message', { text, from: socket.id });
+    });
+
+    // Leave room
+    socket.on('leave-room', (roomId: string) => {
+      socket.leave(roomId);
+      console.log(`[SocketIO] Socket ${socket.id} left room "${roomId}"`);
+    });
+
+    // Disconnect
+    socket.on('disconnect', () => {
+      console.log(`[SocketIO] User disconnected: ${socket.id}`);
     });
   });
 
-  // Store io for later access if needed
-  (app as any).io = io;
+  // HTTP server is attached internally by Socket.IO, no need to expose it
 }
+
+export default attachChatSocket;

@@ -1,10 +1,12 @@
-"""Embedding providers — OpenAI and hash-based fallback."""
+"""Embedding providers — OpenAI, Ollama (local), and hash-based fallback."""
 
 from __future__ import annotations
 
 import hashlib
 import struct
 from typing import Optional
+
+import httpx
 
 
 class Embedder:
@@ -32,6 +34,28 @@ class OpenAIEmbedder(Embedder):
         )
         vec = response.data[0].embedding
         return [float(v) for v in vec]
+
+
+class OllamaEmbedder(Embedder):
+    """Use a local Ollama server for embeddings (no API costs).
+
+    Default model ``nomic-embed-text`` produces 768-dim vectors that
+    match the pgvector ``vector(768)`` schema.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "nomic-embed-text"):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=30)
+
+    async def embed(self, text: str) -> list[float]:
+        resp = await self._client.post(
+            "/api/embed",
+            json={"model": self.model, "input": text, "truncate": False},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["embeddings"][0]
 
 
 class HashEmbedder(Embedder):
