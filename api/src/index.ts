@@ -1,14 +1,14 @@
 /**
- * Entry point — bootstraps the Fastify server with WebSocket support.
+ * Main entry point — bootstraps the Fastify server with WebSocket support.
  */
 
-import { config, validateConfig, validateDatabaseUrl } from "./config";
-import { buildApp } from "./app";
-import { attachChatSocket } from "./ws/chat.socket";
+import { config, validateConfig, validateDatabaseUrl } from './config';
+import { buildApp } from './app';
+import { attachChatSocket } from './ws/chat.socket';
 
 
 async function main() {
-  console.log("[API] Environment variables loaded");
+  console.log('[API] Environment variables loaded');
   validateConfig();
   validateDatabaseUrl();
 

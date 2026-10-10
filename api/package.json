@@ -1,6 +1,6 @@
 {
   "name": "abode-api",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -14,11 +14,11 @@
   "dependencies": {
     "@fastify/cors": "^9.0",
     "@fastify/jwt": "^8.0",
-    "argon2": "^0.40",
+    "@fastify/swagger": "^9.9.2",
+    "@fastify/swagger-ui": "^6.1.2",
     "bcryptjs": "^2.4",
     "better-sqlite3": "^9.6.0",
     "dotenv": "^16.3.1",
-    "fast-jwt": "^6.3.3",
     "fastify": "^4.28",
     "pg": "^8.12",
     "pino": "^8.21",
@@ -26,12 +26,15 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/bcryptjs": "^2.4",
+    "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6",
     "@types/knex": "^0.15.2",
     "@types/node": "^20",
     "@types/pg": "^8.23.1",
     "@types/socket.io": "^3.0.1",
+    "@types/swagger-ui-express": "^4.1.8",
+    "@types/swagger": "^1.0.9",
+    "fastify-swagger": "^5.1.1",
     "tsx": "^4.7",
     "typescript": "^5.4"
   }

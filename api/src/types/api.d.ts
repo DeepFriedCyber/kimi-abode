@@ -6,12 +6,22 @@ import { Property } from '../db/types';
 
 /**
  * Search results response from the search endpoint.
+ * @openapi
+ * components/schemas/SearchResult:
+ *   type: object
+ *   properties:
+ *     properties: { $ref: '#/components/schemas/Property[]' }
+ *     tier_used: { type: string, enum: [semantic, deterministic, keyword] }
+ *     total_matches: { type: integer }
+ *     message: { type: string }
+ *     timestamp: { type: string, format: date-time }
  */
 export interface SearchResult {
   properties: Property[];
   tier_used: string;
   total_matches: number;
   message: string;
+  timestamp?: string; // ISO 8601 datetime for caching invalidation
 }
 
 /**
@@ -29,14 +39,23 @@ export interface ParseResult {
 export interface RegisterResponse {
   id: number;
   email: string;
+  name?: string;
+  message: string;
+  timestamp?: string; // For rate limiting tracking
 }
 
 /**
- * Login/auth response with JWT token (placeholder).
+ * Login/auth response with JWT token.
  */
 export interface AuthResponse {
   access_token: string;
-  token_type: string;
+  token_type: "Bearer";
+  user: {
+    id: number;
+    email: string;
+    name: string;
+  };
+  timestamp?: string; // For cache invalidation
 }
 
 /**
@@ -69,4 +88,36 @@ export interface FrontendProperty extends AIProperty {
 export interface ErrorResponse {
   error: string;
   status?: number;
+  code?: string;
+  message?: string;
+  details?: unknown;
+  timestamp?: string; // For API version tracking and caching
+}
+
+/**
+ * Property entity from database.
+ */
+export interface DatabaseProperty extends AIProperty {
+  address_line1: string;
+  address_line2?: string | null;
+  town?: string | null;
+  postcode?: string | null;
+  outcode?: string | null;
+  property_type: string;
+  num_beds: number;
+  price_paid: number;
+  date_sold?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  source?: string;
+}
+
+/**
+ * Health check response.
+ */
+export interface HealthResponse {
+  status: "healthy" | "unhealthy";
+  db?: boolean;
+  mode: "read-write" | "read-only" | "fallback";
+  timestamp?: string;
 }
