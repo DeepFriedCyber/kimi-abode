@@ -1,8 +1,9 @@
 # Environment secrets — never commit these
 .env
-.env.local
-*.env.*
+.env.*
 !.env.example
+replacements.txt
+*.txt.secret
 
 # Python
 __pycache__/
