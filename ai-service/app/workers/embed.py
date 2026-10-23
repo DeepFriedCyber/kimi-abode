@@ -3,80 +3,138 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+EMBEDDING_DIM = 768
 
 
 async def run_embedding_worker(
     pool,
     embedder,
     batch_size: int = 50,
+    max_batches: int = 1_000,
 ) -> int:
-    """Fetch properties without embeddings and generate them.
+    """Embed properties that have no embedding yet.
 
-    Returns the number of properties updated.
+    Rows whose embedding call fails are skipped (not filled with zero vectors,
+    which would poison vector search and mark the row as done).
     """
     if not pool or not embedder:
         return 0
 
-    sql_fetch = "SELECT id, address_line1 FROM properties WHERE embedding IS NULL LIMIT $1"
-    sql_update = "UPDATE properties SET embedding = $1 WHERE id = $2"
+    fetch_sql = (
+        "SELECT id, address_line1, town, ward, postcode, property_type, num_beds, "
+        "floor_area_sqm, tenure, source "
+        "FROM properties WHERE embedding IS NULL ORDER BY id LIMIT $1"
+    )
+    update_sql = "UPDATE properties SET embedding = $1::vector WHERE id = $2"
 
-    count = 0
-    while True:
+    updated = 0
+
+    for _ in range(max_batches):
         async with pool.acquire() as conn:
-            rows = await conn.fetch(sql_fetch, batch_size)
+            rows = await conn.fetch(fetch_sql, batch_size)
         if not rows:
             break
 
-        # Batch embed
-        addresses = [r["address_line1"] for r in rows]
-        embeddings = await _batch_embed(addresses, embedder)
+        documents = [_embedding_document(row) for row in rows]
+        embeddings = await _batch_embed(documents, embedder)
+
+        pairs = [
+            (_vector_literal(embedding), row["id"])
+            for row, embedding in zip(rows, embeddings)
+            if embedding is not None
+        ]
+
+        if not pairs:
+            # Every row in this batch failed; stop rather than spin forever.
+            logger.error("[EmbedWorker] batch failed entirely; stopping")
+            break
 
         async with pool.acquire() as conn:
-            for row, emb in zip(rows, embeddings):
-                await conn.execute(sql_update, str(emb), row["id"])
-                count += 1
+            await conn.executemany(update_sql, pairs)
 
-    return count
+        updated += len(pairs)
 
-
-async def _batch_embed(addresses: list[str], embedder) -> list[list[float]]:
-    """Batch-embed a list of addresses."""
-    tasks = [embedder.embed(addr) for addr in addresses]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    valid_results = []
-    for r in results:
-        if isinstance(r, Exception):
-            valid_results.append([0.0] * 768)  # fallback zero vector
-        else:
-            valid_results.append(r)
-
-    return valid_results
+    return updated
 
 
-# Background task scheduler (simple interval-based — in prod use Celery/RQ)
-_worker_task = None
+def _embedding_document(row: Any) -> str:
+    """Compose the text that gets embedded.
+
+    Embedding an address alone carries no semantic signal. Composing the
+    property's attributes makes vector search meaningful and gives the LLM
+    something to explain.
+    """
+    parts = [
+        f"{row.get('num_beds') or '?'} bed",
+        row.get("property_type") or "",
+        f"{row.get('floor_area_sqm'):.0f} sqm" if row.get("floor_area_sqm") else "",
+        row.get("tenure") or "",
+        row.get("address_line1") or "",
+        row.get("town") or "",
+        row.get("ward") or "",
+        row.get("postcode") or "",
+        row.get("source") or "",
+    ]
+    return ", ".join(part for part in parts if part).strip()
 
 
-async def start_embedding_worker(pool, embedder, interval_sec: int = 300):
+def _vector_literal(embedding: list[float]) -> str:
+    return "[" + ",".join(f"{float(value):.6f}" for value in embedding) + "]"
+
+
+async def _batch_embed(documents: list[str], embedder) -> list[list[float] | None]:
+    """Embed a batch, returning None for individual failures."""
+    results = await asyncio.gather(
+        *(embedder.embed(document) for document in documents),
+        return_exceptions=True,
+    )
+
+    embeddings: list[list[float] | None] = []
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.warning("[EmbedWorker] embedding failed: %s", result)
+            embeddings.append(None)
+            continue
+        if len(result) != EMBEDDING_DIM:
+            logger.warning(
+                "[EmbedWorker] unexpected dimension %s (expected %s)",
+                len(result),
+                EMBEDDING_DIM,
+            )
+            embeddings.append(None)
+            continue
+        embeddings.append(result)
+    return embeddings
+
+
+_worker_task: asyncio.Task | None = None
+
+
+async def start_embedding_worker(pool, embedder, interval_sec: int = 300) -> None:
     """Start the embedding worker as a background task."""
     global _worker_task
 
-    async def _loop():
+    async def loop() -> None:
         while True:
             try:
-                n = await run_embedding_worker(pool, embedder)
-                if n > 0:
-                    print(f"Embedding worker: {n} properties embedded")
-            except Exception as e:
-                print(f"Embedding worker error: {e}")
+                count = await run_embedding_worker(pool, embedder)
+                if count:
+                    logger.info("[EmbedWorker] embedded %s properties", count)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[EmbedWorker] error: %s", exc, exc_info=True)
             await asyncio.sleep(interval_sec)
 
-    _worker_task = asyncio.create_task(_loop())
+    _worker_task = asyncio.create_task(loop())
 
 
-def stop_embedding_worker():
+def stop_embedding_worker() -> None:
     global _worker_task
     if _worker_task:
         _worker_task.cancel()

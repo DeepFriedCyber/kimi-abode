@@ -28,6 +28,8 @@ class ParsedQuery(BaseModel):
 
     tier: str  # deterministic | llm-1 | llm-2 | semantic-cache | forced-deterministic
     min_beds: int | None = None
+    max_beds: int | None = None
+    min_price: float | None = None
     max_price: float | None = None
     property_types: list[PropertyType] = Field(default_factory=list)
     location: str | None = None
@@ -40,7 +42,7 @@ class ParsedQuery(BaseModel):
 
 
 class ParseRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=500)
 
 
 # ------------------------------------------------------------------ Property
@@ -57,6 +59,13 @@ class Property(BaseModel):
     date_sold: datetime | None = None
     latitude: float | None = None
     longitude: float | None = None
+    floor_area_sqm: float | None = None
+    plot_size_sqm: float | None = None
+    price_per_sqm: float | None = None
+    tenure: str | None = None
+    ward: str | None = None
+    district: str | None = None
+    source_url: str | None = None
     embedding: list[float] | None = None
     source: str = "land-registry"
 

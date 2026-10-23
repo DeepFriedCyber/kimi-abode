@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from .parser import parse_query, ParsedQuery
+from .parser import ParsedQuery, parse_query
+
+logger = logging.getLogger(__name__)
 
 
 async def search(
@@ -15,38 +18,35 @@ async def search(
 ) -> dict[str, Any]:
     """Execute a property search.
 
-    Failover chain:
-    1. Semantic cache -> ~20ms (repeat queries)
-    2. Hybrid search (vector + keyword) via pgvector -> ~50-200ms
-    3. Deterministic filter-only -> ~5ms
+    Failover chain: semantic (vector + filters) → filter-only → empty result.
     """
-    
     parsed = await parse_query(query)
 
     if not pool:
-        # No database pool - return deterministic fallback results
-        print(f"[Search] Running in fallback mode (no PostgreSQL pool). Query: {query}")
+        logger.info("[Search] no database pool; returning empty result")
         return {
             "properties": [],
             "tier_used": "deterministic-fallback",
             "total_matches": 0,
-            "message": "Running in dev mode without database. Configure DATABASE_URL for full search.",
+            "message": "Running without a database. Configure DATABASE_URL for search.",
         }
 
-    # --- generate embedding -------------------------------------------------
-    emb = None
-    if embedder:
-        emb = await embedder.embed(query)
+    embedding: list[float] | None = None
+    if embedder is not None:
+        try:
+            embedding = await embedder.embed(query)
+        except Exception as exc:  # noqa: BLE001 - degrade to keyword search
+            logger.warning("[Search] embedding failed, using filters only: %s", exc)
 
     from .repository import execute_search_pg
 
-    rows, total = await execute_search_pg(pool, parsed, query, emb, None, limit)
+    rows, total = await execute_search_pg(pool, parsed, query, embedding, None, limit)
 
     return {
-        "properties": [dict(r) for r in rows],
-        "tier_used": parsed.tier or "deterministic",
+        "properties": [dict(row) for row in rows],
+        "tier_used": "semantic" if embedding else (parsed.tier or "deterministic"),
         "total_matches": total,
-        "message": f"Found {total} properties matching: {query}",
+        "message": f"Found {total} properties matching “{query[:50]}”",
     }
 
 
@@ -57,62 +57,59 @@ async def search_location(
 ) -> dict[str, Any]:
     """Search by town/district name."""
     if not pool:
-        return {"properties": [], "total_matches": 0, "message": f"no pool for location={location}"}
+        return {
+            "properties": [],
+            "total_matches": 0,
+            "message": f"No database configured (location={location})",
+        }
 
     from .repository import execute_search_pg
+
     parsed = ParsedQuery(
-        raw=f"properties in {location}", tier="", min_beds=None,
-        max_price=None, property_types=[], location=location,
-        has_location=True, has_price=False,
+        raw=f"properties in {location}",
+        tier="deterministic",
+        location=location,
+        has_location=True,
     )
-    rows, total = await execute_search_pg(pool, parsed, f"in {location}", None, None, limit)
+    rows, total = await execute_search_pg(
+        pool, parsed, f"in {location}", None, None, limit
+    )
+
     return {
-        "properties": [dict(r) for r in rows],
+        "properties": [dict(row) for row in rows],
         "total_matches": total,
         "message": f"Found {total} properties near {location}",
     }
 
 
-async def count_properties(
-    pool=None,
-) -> dict[str, Any]:
-    """Count total properties."""
+async def count_properties(pool=None) -> dict[str, Any]:
+    """Count properties in the database."""
     if not pool:
         return {"count": 0, "message": "No database connection available"}
 
-    from .repository import count_properties as repo_count
-    count = await repo_count(pool)
-    
-    return {
-        "count": count,
-        "tier_used": "deterministic" if not hasattr(repo_count, 'pool') else "pgvector",
-        "message": f"Database contains {count} properties",
-    }
+    from .repository import count_properties as repository_count
+
+    count = await repository_count(pool)
+    return {"count": count, "message": f"Database contains {count} properties"}
 
 
-async def health_check(
-    pool=None,
-) -> dict[str, Any]:
-    """Health check for search service."""
+async def health_check(pool=None) -> dict[str, Any]:
+    """Health probe for the search subsystem."""
     if not pool:
         return {
-            "status": "healthy",
+            "status": "degraded",
             "mode": "fallback",
-            "message": "Running without database (dev mode)",
+            "message": "Running without a database",
         }
 
     try:
-        count = await count_properties(pool)
-        return {
-            "status": "healthy",
-            "count": count.get("count", 0),
-            "mode": "production",
-            "message": f"Database connected. Found {count.get('count', 0)} properties",
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "mode": "fallback",
-            "message": f"Database connection failed: {e}",
-        }
+        result = await count_properties(pool)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unhealthy", "error": str(exc), "mode": "fallback"}
+
+    return {
+        "status": "healthy",
+        "count": result["count"],
+        "mode": "production",
+        "message": f"Database connected ({result['count']} properties)",
+    }

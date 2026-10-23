@@ -1,14 +1,87 @@
-"""Provider routing — query execution strategy selection with SQLite fallback."""
+"""Provider routing — strategy selection for query execution.
+
+Providers are tried in order. The deterministic/demo provider exists so the
+product can be explored without a database; it reads a fixture file rather than
+embedding 500 records in Python source, and is disabled when DEMO_DATA is off.
+"""
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+FIXTURE_PATH = Path(__file__).resolve().parent.parent / "data" / "demo_listings.json"
+
+# Fixture property types are abbreviated ("semi_d", "terrace", ...).
+_TYPE_ALIASES = {
+    "semi_d": "semi-detached",
+    "semi": "semi-detached",
+    "semi-detached": "semi-detached",
+    "terrace": "terraced",
+    "terraced": "terraced",
+    "detached": "detached",
+    "flat": "flat",
+    "bungalow": "bungalow",
+    "maisonette": "maisonette",
+}
+
+
+def normalise_type(raw: str | None) -> str:
+    """Map fixture/agent property-type spellings onto canonical values."""
+    if not raw:
+        return "unknown"
+    lowered = raw.strip().lower().replace("-", "_")
+    if lowered in _TYPE_ALIASES:
+        return _TYPE_ALIASES[lowered]
+    # Compound values such as "detached_bungalow" / "semi_d_bungalow".
+    for token, canonical in _TYPE_ALIASES.items():
+        if token in lowered:
+            return canonical
+    return lowered.replace("_", "-")
+
+
+SEARCH_STOPWORDS = {
+    "the", "and", "with", "for", "from", "house", "home", "property",
+    "properties", "bed", "beds", "bedroom", "bedrooms", "a", "an", "of",
+    "to", "in", "near", "under", "over", "best", "nice", "good", "great",
+    "area", "areas",
+}
+
+
+def _search_blob(property_row: dict[str, Any]) -> str:
+    """Lower-cased text used for demo keyword matching (address + description)."""
+    features = property_row.get("features") or []
+    if isinstance(features, list):
+        features = " ".join(str(feature) for feature in features)
+
+    return " ".join(
+        str(part)
+        for part in (
+            property_row.get("address_line1"),
+            property_row.get("address_line2"),
+            property_row.get("town"),
+            property_row.get("ward"),
+            property_row.get("postcode"),
+            property_row.get("property_type"),
+            property_row.get("description"),
+            features,
+        )
+        if part
+    ).lower()
 
 
 @dataclass
 class ProviderResult:
     """Container for a single provider's output."""
+
     tier: str
     results: list = field(default_factory=list)
     message: str = ""
@@ -33,627 +106,175 @@ class SearchProvider:
         self.embedder = embedder
 
     async def execute(self, query: str) -> dict[str, Any] | None:
-        """Execute a search query. Returns None when no DB pool is configured."""
+        """Execute a search, or return None when no pool is configured."""
         if not self.pool:
             return None
-        
+
         try:
             from .search import search
+
             return await search(query, pool=self.pool, embedder=self.embedder)
-        except Exception as e:
-            # Log error but continue to next provider
-            print(f"[SearchProvider] Error executing pgvector search: {e}")
+        except Exception as exc:  # noqa: BLE001 - fall through to next provider
+            logger.warning("[SearchProvider] pgvector search failed: %s", exc)
             return None
+
+
+@lru_cache(maxsize=1)
+def load_fixture() -> list[dict[str, Any]]:
+    """Load the demo property fixture once per process."""
+    if not FIXTURE_PATH.exists():
+        logger.warning("[Demo] fixture not found at %s", FIXTURE_PATH)
+        return []
+
+    try:
+        payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("[Demo] failed to load fixture: %s", exc)
+        return []
+
+    # Support both the wrapped format written by scripts/import_listings.py and
+    # a bare list for backwards compatibility.
+    records = payload.get("records", []) if isinstance(payload, dict) else payload
+
+    for record in records:
+        record["property_type"] = normalise_type(record.get("property_type"))
+    return records
 
 
 class DeterministicSearchProvider:
-    """Fallback provider that uses deterministic filtering (no vector search)."""
+    """Filter-only provider backed by a fixture. Never used in production."""
 
     name = "deterministic-search"
 
-    def __init__(self):
-        # In-memory mock data for dev mode when DB is unavailable
-                # Sandbach historical listings data (~500 properties)
-        self.mock_properties = [
-        {"id": 1, "address_line1": "51 Cloverfields, CW1 5AL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 387000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 2, "address_line1": "164 Middlewich Road, CW11 1JD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 540000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 3, "address_line1": "126 Waterloo Road, CW1 5TA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 228000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 4, "address_line1": "19 Newton Bank, CW10 9EX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 100000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 5, "address_line1": "37 Beechfield Drive, CW10 9QE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 175000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 6, "address_line1": "19 Langley Drive, CW2 8LP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 195000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 7, "address_line1": "8 Bradwall Street, CW11 1GJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 265000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 8, "address_line1": "76 James Atkinson Way, CW1 3NU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 335000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 9, "address_line1": "18 Hesketh Croft, CW1 4RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 265000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 10, "address_line1": "213 Alton Street, CW2 7PU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 200000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 11, "address_line1": "15 Lunt Avenue, CW2 7LZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 124000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 12, "address_line1": "2 Portland Grove, CW1 5TY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 215000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 13, "address_line1": "9 London Road, CW11 3BD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 2, "price_paid": 565000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 14, "address_line1": "16 Mardale Court, CW4 7JP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 270000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 15, "address_line1": "202 Broad Street, CW1 3UB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 144000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 16, "address_line1": "81 Manor Road, CW11 2ND", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 335000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 17, "address_line1": "3 Hassall Road, CW11 4HQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 240000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 18, "address_line1": "6 Venables Way, CW10 0RR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 250000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 19, "address_line1": "18 Morgan Close, CW2 7UJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 1, "price_paid": 72000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 20, "address_line1": "2 Coppice Drive, CW10 0TB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 380000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 21, "address_line1": "25 Moston Road, CW11 3GL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 241500, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 22, "address_line1": "17 Woodend Close, CW10 0DZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 155000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 23, "address_line1": "13 Smithfield Lane, CW11 4JA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 4, "price_paid": 665000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 24, "address_line1": "102 Ludlow Avenue, CW1 6DY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 205000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 25, "address_line1": "11 Newtons Crescent, CW11 4TS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 440000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 26, "address_line1": "25 Neville Street, CW2 6LA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 170000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 27, "address_line1": "7 Offley Road, CW11 1GY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 915000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 28, "address_line1": "3 The Locks, CW10 9PD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace_bungalow", "num_beds": 2, "price_paid": 200000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 29, "address_line1": "12 William Foden Close, CW11 3SE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 290000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 30, "address_line1": "13 Heathfield Avenue, CW1 3BA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 140000, "date_sold": "Mar 2025", "latitude": null, "longitude": null},
-{"id": 31, "address_line1": "86 Manor Way, CW2 6JX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 195000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 32, "address_line1": "15 Grosvenor Avenue, ST7 2BZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 380000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 33, "address_line1": "2 Fowler Close, CW2 6BN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 144000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 34, "address_line1": "84 Bessancourt, CW4 7NB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 255000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 35, "address_line1": "16 Long Lane, CW10 0BL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 260000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 36, "address_line1": "4 Cornmill Close, CW11 3NH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 7, "price_paid": 692500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 37, "address_line1": "96 Nelson Street, CW2 7LN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 135000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 38, "address_line1": "118 West Street, CW1 3HG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 1, "price_paid": 115000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 39, "address_line1": "261 Broad Street, CW1 4JJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 108000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 40, "address_line1": "48 Hughes Drive, CW2 7UA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 170000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 41, "address_line1": "3 Langley Drive, CW2 8LP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 295000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 42, "address_line1": "11 Condliffe Close, CW11 4HP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 186000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 43, "address_line1": "37 Buxton Avenue, CW1 6EU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 145000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 44, "address_line1": "87 Marshfield Avenue, CW2 8TE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 175000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 45, "address_line1": "11 Woodland Gardens, CW1 4JS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 220500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 46, "address_line1": "176 Middlewich Road, CW11 1JD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 392500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 47, "address_line1": "8 Eaton Close, CW11 1HS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 2, "price_paid": 510000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 48, "address_line1": "23 Davenham Way, CW10 0SW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 235000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 49, "address_line1": "73 James Atkinson Way, CW1 3NX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 330000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 50, "address_line1": "St Andrews School House Crewe Road, CW1 5QU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 425000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 51, "address_line1": "161 Underwood Lane, CW1 3SB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 120000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 52, "address_line1": "9 Dee Close, CW11 1XJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 215000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 53, "address_line1": "13 The Dingle, CW1 5RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 555000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 54, "address_line1": "1 Monarch Close, CW2 7UF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 30000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 55, "address_line1": "1 Heath Avenue, ST7 3RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 252000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 56, "address_line1": "1 Carlisle Street, CW2 7NX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 130000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 57, "address_line1": "158 Wistaston Road, CW2 7RJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 155000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 58, "address_line1": "25 Heathend Road, ST7 2SQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 375000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 59, "address_line1": "15 Rowan Close, CW10 0TA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 145000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 60, "address_line1": "18 Selkirk Drive, CW4 7LJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 290000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 61, "address_line1": "401 Crewe Road, CW11 4RS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 163500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 62, "address_line1": "10 Middlewich Street, CW1 4BS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 107000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 63, "address_line1": "97 Portree Drive, CW4 7JF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 390000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 64, "address_line1": "6 Boothsmere Close, CW11 1FA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 415000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 65, "address_line1": "14 Chestnut Drive, CW4 7QE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 417500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 66, "address_line1": "25 Coniston Drive, CW4 7LA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 455000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 67, "address_line1": "58 Mills Way, CW1 4TG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 343000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 68, "address_line1": "49 Kestrel Drive, CW1 3YX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 1, "price_paid": 125000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 69, "address_line1": "58 Gresty Road, CW2 6DY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 105000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 70, "address_line1": "53 Moreton Road, CW2 8QT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 156000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 71, "address_line1": "8 Lunt Avenue, CW2 7LZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 122000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 72, "address_line1": "39 Ridgway Street, CW1 4BY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 85000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 73, "address_line1": "8 Heathwood Drive, ST7 2HW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 210000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 74, "address_line1": "33 Westbourne Avenue, CW1 3QP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 4, "price_paid": 200000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 75, "address_line1": "10 Pool View, CW11 4QZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 630000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 76, "address_line1": "30 Leicester Avenue, ST7 2BS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 400000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 77, "address_line1": "21 Cranfield Drive, ST7 2LQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 342500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 78, "address_line1": "30 Redwood Drive, CW1 3GS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 4, "price_paid": 195000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 79, "address_line1": "41 Needham Drive, CW4 8FB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 590000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 80, "address_line1": "18 Thatch Close, CW4 8GF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 0, "price_paid": 530000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 81, "address_line1": "30 Coleridge Close, CW11 3NN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 262000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 82, "address_line1": "23 Beltony Drive, CW1 4TX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 180000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 83, "address_line1": "71 Ramsbottom Street, CW1 3AN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 22750, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 84, "address_line1": "4 Bessemer Way, CW1 3ZG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 0, "price_paid": 165000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 85, "address_line1": "178 Henry Street, CW1 4BG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 176000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 86, "address_line1": "4 Eaton Close, CW11 1HS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 370000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 87, "address_line1": "17 Stanier Close, CW1 5GP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 1, "price_paid": 295000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 88, "address_line1": "29 Mellor Street, CW1 4DB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 110000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 89, "address_line1": "101 Ernest Street, CW2 6JZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 185000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 90, "address_line1": "85 Hall Oshaw Street, CW1 4AD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 129500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 91, "address_line1": "18 Kingswood Crescent, CW10 0RP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 271000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 92, "address_line1": "14 Walthall Street, CW2 7JZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 94050, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 93, "address_line1": "8 Coleridge Close, CW11 3NN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 190000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 94, "address_line1": "52 Albion Street, CW2 8NG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 173000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 95, "address_line1": "20 Stanhope Avenue, CW1 6ED", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 240000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 96, "address_line1": "7 Alsager Road, CW11 4RG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 295000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 97, "address_line1": "21 Culland Street, CW2 6DQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 118500, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 98, "address_line1": "15 Gowy Close, ST7 2HX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 208000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 99, "address_line1": "28 Arley Walk, CW11 3ZN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 305000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 100, "address_line1": "605 West Street, CW2 8SH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 275000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 101, "address_line1": "10 Russet Close, CW10 9EP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace_bungalow", "num_beds": 2, "price_paid": 140000, "date_sold": "Feb 2025", "latitude": null, "longitude": null},
-{"id": 102, "address_line1": "28 Coleridge Close, CW11 3NN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 240000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 103, "address_line1": "9 Westminster Street, CW2 7LQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 126000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 104, "address_line1": "15 Weaver Close, ST7 2NZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 140000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 105, "address_line1": "122 Lansdowne Road, CW1 5LR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 190000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 106, "address_line1": "143 Long Lane South, CW10 0AT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 230000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 107, "address_line1": "10 Woodend Close, CW10 0DZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 180000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 108, "address_line1": "211 Manor Way, CW2 6PH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 5, "price_paid": 31092, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 109, "address_line1": "4 Bramble Close, CW10 9FZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 350000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 110, "address_line1": "14 Greendale Drive, CW10 0PH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 270000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 111, "address_line1": "445 Crewe Road, CW11 3RJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 170000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 112, "address_line1": "35 Ludlow Avenue, CW1 6DZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 100000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 113, "address_line1": "3 Merlin Court, CW1 3TH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 185000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 114, "address_line1": "28 Cornwall Grove, CW1 3BE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 127500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 115, "address_line1": "246 Hungerford Road, CW1 6HG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 125000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 116, "address_line1": "38 Charlesworth Street, CW1 4DE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 110000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 117, "address_line1": "56 Oakland Avenue, CW1 5PB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 250000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 118, "address_line1": "20 Green Street, CW11 1GX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 155000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 119, "address_line1": "114 Middlewich Street, CW1 4DL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 320000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 120, "address_line1": "4 Bowkers Croft, CW11 4RR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 325000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 121, "address_line1": "54 Chambers Street, CW2 6HJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 82500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 122, "address_line1": "5 Hutchins Close, CW10 0EX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 4, "price_paid": 179000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 123, "address_line1": "13 St Anns Road, CW10 9BN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 1, "price_paid": 100000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 124, "address_line1": "25 Evans Street, CW1 3TR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 180000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 125, "address_line1": "39 Goldsmith Drive, CW11 3GS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 260000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 126, "address_line1": "26 Heath Avenue, ST7 3RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 236000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 127, "address_line1": "6 Tennyson Avenue, CW1 5JR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 155000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 128, "address_line1": "6 Heath View, CW1 5SS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 161000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 129, "address_line1": "9 Wallcroft Gardens, CW10 9AD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 183000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 130, "address_line1": "9 Bulkeley Street, CW1 6ET", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 157000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 131, "address_line1": "46 Oldfield Road, CW11 3LN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 257500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 132, "address_line1": "2 Mill Lane, CW4 8AT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 380000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 133, "address_line1": "149b Heath Road, CW11 2LE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 255000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 134, "address_line1": "6 Oakwood Crescent, CW11 2LL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 223000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 135, "address_line1": "18 Tynedale Avenue, CW2 7NY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 220000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 136, "address_line1": "19 Chassagne Square, CW1 3GJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 4, "price_paid": 198000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 137, "address_line1": "8 Westminster Street, CW2 7LG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 117000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 138, "address_line1": "48 Lord Street, CW2 7DH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 72500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 139, "address_line1": "6 Pool View, CW11 4QZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 5, "price_paid": 435000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 140, "address_line1": "45 Park Lane, CW11 1EN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 240000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 141, "address_line1": "9 Falmouth Road, CW1 3QS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 155000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 142, "address_line1": "6 The Butts, ST7 2NS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 215000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 143, "address_line1": "99 Edleston Road, CW2 7HP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 85000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 144, "address_line1": "25 Rockwood Avenue, CW2 8LU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 155500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 145, "address_line1": "260 Badger Avenue, CW1 3LW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 141000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 146, "address_line1": "37 Holland Street, CW1 3TT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 1, "price_paid": 142600, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 147, "address_line1": "4 Ingleton Close, CW4 7LF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 270000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 148, "address_line1": "104 Harpur Crescent, ST7 2SY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 315000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 149, "address_line1": "37 Westminster Street, CW2 7LQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 155000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 150, "address_line1": "6 Padstow Close, CW1 3XW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 179995, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 151, "address_line1": "27 Rushton Drive, CW10 0NJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 275000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 152, "address_line1": "193 Alton Street, CW2 7PU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 150000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 153, "address_line1": "79 Third Avenue, CW11 4PG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 170000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 154, "address_line1": "406 Underwood Lane, CW1 3SE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 140000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 155, "address_line1": "67 Minshull New Road, CW1 3PE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 136000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 156, "address_line1": "18 Mayfield Mews, CW1 3FZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 126000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 157, "address_line1": "64 Sandbach Road, ST7 3RN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 271500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 158, "address_line1": "41 Electricity Street, CW2 7EW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 147500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 159, "address_line1": "32 Wardle Mews, CW10 0EP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 189950, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 160, "address_line1": "4 Smallwood Forge, CW11 2UF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 5, "price_paid": 545000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 161, "address_line1": "90 Oakley Street, CW1 2NL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 128000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 162, "address_line1": "12 Hungerford Terrace, CW1 6HF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 217000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 163, "address_line1": "51 Sandown Road, CW1 3TF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 208000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 164, "address_line1": "7 Henbury Close, CW10 0NH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 331000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 165, "address_line1": "20 Goldsmith Drive, CW11 3GR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 245000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 166, "address_line1": "5 Rigg Street, CW1 3EB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 118000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 167, "address_line1": "62 Gresty Road, CW2 6DY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 63000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 168, "address_line1": "17 Surrey Street, CW1 4AB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 77500, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 169, "address_line1": "3 Meadowgate Close, CW11 3ZP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 400000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 170, "address_line1": "118 Stewart Street, CW2 8LY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 190000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 171, "address_line1": "5 Wordsworth Way, ST7 2NU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 180000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 172, "address_line1": "59 Hadrian Way, CW10 9RB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 260000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 173, "address_line1": "9 Hughes Drive, CW2 7UA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 155000, "date_sold": "Jan 2025", "latitude": null, "longitude": null},
-{"id": 174, "address_line1": "44 Bradwall Street, CW11 1GJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 170000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 175, "address_line1": "72 Bateman Close, CW1 3DQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 185000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 176, "address_line1": "85 Lambourn Drive, CW1 4TL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 205000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 177, "address_line1": "52 Newfield Drive, CW1 4AS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 155000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 178, "address_line1": "23 Arderne Avenue, CW2 8NS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 212500, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 179, "address_line1": "17 Dorric Way, CW1 3SX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 190000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 180, "address_line1": "71 Parkers Road, CW1 4TP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 257500, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 181, "address_line1": "128 Meredith Street, CW1 2PJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 125000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 182, "address_line1": "Greenbank Farm Back Lane, CW11 2UN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "other", "num_beds": 3, "price_paid": 1065000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 183, "address_line1": "Castle Bank School Lane, CW11 2LS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 250000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 184, "address_line1": "168 Middlewich Road, CW7 3NN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 285000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 185, "address_line1": "10 Oak Street, ST7 3SJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 107000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 186, "address_line1": "2 Tiverton Close, CW11 1ZY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 0, "price_paid": 262500, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 187, "address_line1": "16 Dean Street, CW10 9DW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 160000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 188, "address_line1": "92 Hassall Road, CW11 4HN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 240000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 189, "address_line1": "29 Moston Road, CW11 3GL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 240000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 190, "address_line1": "12 Webbs Lane, CW10 9DN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 172500, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 191, "address_line1": "58 Sandbach Road, ST7 3RN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 152000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 192, "address_line1": "20 Richardson Close, CW11 3GU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 122000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 193, "address_line1": "41 Albert Street, CW1 2QD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 88000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 194, "address_line1": "2 Pyms Lane, CW1 3PJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 130000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 195, "address_line1": "46 Queen Street, CW1 4AL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 130000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 196, "address_line1": "206 Bedford Street, CW2 6JL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 180000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 197, "address_line1": "50 Cherry Lane, ST7 3QF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 400000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 198, "address_line1": "44 Welles Street, CW11 1GU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 124000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 199, "address_line1": "57 Princess Drive, CW11 1BP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 310000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 200, "address_line1": "23 Sheringham Drive, CW1 3XJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 2, "price_paid": 218000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 201, "address_line1": "39 Green Street, CW11 1GX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 195000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 202, "address_line1": "4 Sheringham Drive, CW1 3XJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 118000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 203, "address_line1": "7 Needham Drive, CW4 8FB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 475000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 204, "address_line1": "7 Tollitt Street, CW1 2LD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 117000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 205, "address_line1": "11c Cross Lane, CW10 0ET", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 217000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 206, "address_line1": "6 Orchard Close, CW10 0AU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 235000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 207, "address_line1": "162 Crewe Road, CW11 4PY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 715000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 208, "address_line1": "81 Becconsall Drive, CW1 4RP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 295000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 209, "address_line1": "1 Brookmere Close, CW11 1XT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 140000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 210, "address_line1": "59 Elm Drive, CW4 7QA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 470000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 211, "address_line1": "28 Laura Street, CW2 6HA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 115000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 212, "address_line1": "12 Herbert Swindells Close, CW2 6GP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 0, "price_paid": 200000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 213, "address_line1": "12a Burjen Way, CW1 3TP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 170000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 214, "address_line1": "284 Walthall Street, CW2 7LE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 120000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 215, "address_line1": "16 Beeston Close, CW10 0SH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 320000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 216, "address_line1": "10 Culland Street, CW2 6DQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 126500, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 217, "address_line1": "91 Elworth Road, CW11 3HJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 315000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 218, "address_line1": "Apartment 3 Points House Dale Way, CW1 3GT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 117145, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 219, "address_line1": "Flat 18 Bernard Court Chester Road, CW4 7EY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 1, "price_paid": 100000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 220, "address_line1": "61 Brooklyn Street, CW2 7JE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 124000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 221, "address_line1": "14 Newfield Drive, CW1 4AS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 155000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 222, "address_line1": "3 Barker Street, CW2 6BL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 182000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 223, "address_line1": "145 Wistaston Road, CW2 7RH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 65000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 224, "address_line1": "5 Woodside Avenue, ST7 2DL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 93000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 225, "address_line1": "39 Queens Drive, CW11 1BN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 280000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 226, "address_line1": "64 Mills Way, CW1 4TG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 355000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 227, "address_line1": "37 Hungerford Road, CW1 5EQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 148500, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 228, "address_line1": "1 Nightingale Way, ST7 2GH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 385000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 229, "address_line1": "92 Edleston Road, CW2 7HD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 94000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 230, "address_line1": "4 Harbutts Court, CW10 9PU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 108500, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 231, "address_line1": "19 Heath Avenue, ST7 3RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 265000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 232, "address_line1": "28 Langley Drive, CW2 8LN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 315000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 233, "address_line1": "105 Claughton Avenue, CW2 6ET", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 150000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 234, "address_line1": "26 Rye Close, ST7 2XZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 285000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 235, "address_line1": "140 Sydney Road, CW1 5NF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 430000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 236, "address_line1": "9 Pool View, CW11 4QZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 5, "price_paid": 430000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 237, "address_line1": "10 Henry Street, CW1 5PS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 205000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 238, "address_line1": "13 Herbert Street, CW1 5LZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 165000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 239, "address_line1": "32 Rigg Street, CW1 3EB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 60000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 240, "address_line1": "25 Station Road, CW4 7AY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 330000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 241, "address_line1": "9 Gainsborough Road, CW2 7PH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 187200, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 242, "address_line1": "168 Sandbach Road, ST7 3RB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 325000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 243, "address_line1": "560 Crewe Road, CW11 3RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 224000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 244, "address_line1": "101 Elton Road, CW11 3NF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 190000, "date_sold": "Dec 2024", "latitude": null, "longitude": null},
-{"id": 245, "address_line1": "2 Railway View, CW1 4BN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 1, "price_paid": 98000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 246, "address_line1": "165 Crewe Road, CW11 4PA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 222000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 247, "address_line1": "2 Hassall Road, CW11 4HQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 425000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 248, "address_line1": "41 Bradwall Street, CW11 1GJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 230000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 249, "address_line1": "30 Crewe Green Avenue, CW1 5NT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 243500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 250, "address_line1": "5 Victoria Avenue, CW1 5PF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 223500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 251, "address_line1": "Flat 24 The Point Crewe Road, ST7 2JJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 119000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 252, "address_line1": "4 Lyndale Grove, CW12 4YW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 0, "price_paid": 620000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 253, "address_line1": "75 Alton Street, CW2 7QF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 84000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 254, "address_line1": "24 Rookery Close, CW11 3NJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 377500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 255, "address_line1": "78 Beech Avenue, ST7 3JD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 5, "price_paid": 380000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 256, "address_line1": "27 Winston Avenue, ST7 2BE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 220000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 257, "address_line1": "Whisterfield Brereton Heath Lane, CW12 4SY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 550000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 258, "address_line1": "16 Brookfield, CW1 5WE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 310000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 259, "address_line1": "4 Cestria Close, CW11 3FU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 258000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 260, "address_line1": "86 Grange Way, CW11 1ES", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 4, "price_paid": 130000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 261, "address_line1": "38 Bateman Close, CW1 3DQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 190000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 262, "address_line1": "23 Wardle Mews, CW10 0EP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 175000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 263, "address_line1": "52 Alton Street, CW2 7QF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 130000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 264, "address_line1": "Greenroofs Clay Lane, CW1 5SF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 220000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 265, "address_line1": "6c Eva Street, CW11 3BP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 200000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 266, "address_line1": "40 Broxton Avenue, CW10 0SE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 235000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 267, "address_line1": "40 George Street, CW11 3BL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 200000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 268, "address_line1": "71 Hayhurst Avenue, CW10 0AY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 160000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 269, "address_line1": "203 Heath Road, CW11 2LE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 270000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 270, "address_line1": "15 Frances Street, CW2 6HF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 100000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 271, "address_line1": "46 School Lane, CW11 3HU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 116000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 272, "address_line1": "221 Walthall Street, CW2 7LE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 92500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 273, "address_line1": "17 Culland Street, CW2 6DQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 120000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 274, "address_line1": "52 Stalbridge Road, CW2 7LP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 150000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 275, "address_line1": "4 Laxton Way, CW10 9EN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace_bungalow", "num_beds": 2, "price_paid": 150000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 276, "address_line1": "17 West Way, CW4 7DG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 379500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 277, "address_line1": "14 Offley Road, CW11 1GY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 0, "price_paid": 450000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 278, "address_line1": "15 Clement Drive, CW1 3GN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 265000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 279, "address_line1": "67 Primrose Avenue, CW1 5NY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 250000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 280, "address_line1": "55 Hassall Road, CW11 4HN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 400000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 281, "address_line1": "34 Gawsworth Drive, CW11 1DY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 385000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 282, "address_line1": "210 Wistaston Road, CW2 7RJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 131500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 283, "address_line1": "22 Micklewright Avenue, CW1 4DF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 135000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 284, "address_line1": "155 Long Lane South, CW10 0AT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 213500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 285, "address_line1": "2 Winston Avenue, ST7 2BE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 290000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 286, "address_line1": "238 Badger Avenue, CW1 3LP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 135000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 287, "address_line1": "25 Mossford Avenue, CW1 3RT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 155000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 288, "address_line1": "85 Pennymoor Drive, CW10 9QP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 240000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 289, "address_line1": "109 Crewe Road, CW1 5RE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 290000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 290, "address_line1": "Penderell Elton Road, CW11 3NB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 272000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 291, "address_line1": "14 Chadwick Road, CW10 0EA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 150000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 292, "address_line1": "29 Badger Avenue, CW1 3JG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 140000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 293, "address_line1": "22 St Matthews Close, CW1 5TW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 187500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 294, "address_line1": "12 Latham Road, CW11 4PJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 200000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 295, "address_line1": "121 Edleston Road, CW2 7HP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "other", "num_beds": 1, "price_paid": 115000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 296, "address_line1": "6 Dalton Court, CW11 1YD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 590000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 297, "address_line1": "30 Third Avenue, CW11 4PF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 203000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 298, "address_line1": "12 Grenville Close, CW1 5TU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 195000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 299, "address_line1": "202 Market Street, CW1 2NP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 86000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 300, "address_line1": "19 Hall Drive, ST7 2UD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 254000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 301, "address_line1": "85 Elworth Road, CW11 3HN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 367500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 302, "address_line1": "8 Mill Hill Lane, CW11 4PN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 350000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 303, "address_line1": "9 Barrows Close, CW1 4RR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 245000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 304, "address_line1": "4 Betjeman Way, CW1 5FS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 197000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 305, "address_line1": "5 Heath Terrace, CW11 2SU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 214000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 306, "address_line1": "34 Derrington Avenue, CW2 7JB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 105000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 307, "address_line1": "11 Angus Grove, CW10 9GR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 279950, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 308, "address_line1": "86 Stewart Street, CW2 8LX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 154000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 309, "address_line1": "90 Manor Road, CW11 2LU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 575000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 310, "address_line1": "50 Kipling Way, CW1 5JG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 4, "price_paid": 250000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 311, "address_line1": "29 Frances Street, CW2 6HF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 90000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 312, "address_line1": "36 Renaissance Way, CW1 6HT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 465000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 313, "address_line1": "35 Brynlow Drive, CW10 0PD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 222000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 314, "address_line1": "10 Crewe Green Avenue, CW1 5NT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 220000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 315, "address_line1": "16 Stanhope Avenue, CW1 6ED", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 219400, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 316, "address_line1": "51 Richard Moon Street, CW1 3AU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 102000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 317, "address_line1": "25 Bessancourt, CW4 7AN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 273000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 318, "address_line1": "91 West Street, CW1 3HF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 110500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 319, "address_line1": "43 Masefield Way, CW11 3ZJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 217175, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 320, "address_line1": "12 Lea Close, CW11 4HT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 350000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 321, "address_line1": "479 West Street, CW1 3HZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 99500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 322, "address_line1": "13 Moreton Road, CW2 8QU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 135000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 323, "address_line1": "41 Sheringham Drive, CW1 3XJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 163000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 324, "address_line1": "69 Remer Street, CW1 4LU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 172000, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 325, "address_line1": "33 Ivatt Drive, CW2 6BF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 97500, "date_sold": "Nov 2024", "latitude": null, "longitude": null},
-{"id": 326, "address_line1": "19 Sherwin Street, CW2 6DJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 148000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 327, "address_line1": "30 Bracken Close, ST7 3JA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 224000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 328, "address_line1": "30 Rutland Close, CW11 3NX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 155000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 329, "address_line1": "1 Chapel Lane, ST7 3SD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 330000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 330, "address_line1": "7 Chapel Lane, ST7 3SD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 240000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 331, "address_line1": "36 Rudheath Close, CW2 8TL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 135000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 332, "address_line1": "8 The Crescent, CW10 9HH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 115000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 333, "address_line1": "93 Gainsborough Road, CW2 7PJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 114000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 334, "address_line1": "34 Lodge Road, ST7 2HD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 5, "price_paid": 575000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 335, "address_line1": "18 Crewe Green Avenue, CW1 5NT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 284000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 336, "address_line1": "110 Gainsborough Road, CW2 7PL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 205000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 337, "address_line1": "4 Gowy Close, ST7 2HX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 180000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 338, "address_line1": "47 Kingsley Road, CW1 5PG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 215000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 339, "address_line1": "17 Sandiford Road, CW4 7BY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 280000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 340, "address_line1": "6 Allman Close, CW1 3NY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 295000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 341, "address_line1": "12 Foxholme Court, CW1 5HF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 120000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 342, "address_line1": "37 Broxton Avenue, CW10 0SE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 237000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 343, "address_line1": "29 Brynlow Drive, CW10 0PD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 293000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 344, "address_line1": "17 Cresswellshaw Road, ST7 2NL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 230000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 345, "address_line1": "42 Lord Street, CW2 7DH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 130000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 346, "address_line1": "17 Eaton Road, ST7 2BQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 305000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 347, "address_line1": "74 Heron Way, CW11 3AU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 0, "price_paid": 210000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 348, "address_line1": "13 Hungerford Terrace, CW1 6HF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 4, "price_paid": 150000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 349, "address_line1": "37 Crewe Road, ST7 2EY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 690000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 350, "address_line1": "207 Underwood Lane, CW1 3SE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 140000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 351, "address_line1": "236 Walthall Street, CW2 7LD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 145000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 352, "address_line1": "70 Verdin Court, CW1 3YH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 162000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 353, "address_line1": "7 Lyceum Way, CW1 3YF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 220000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 354, "address_line1": "57 Pikemere Road, ST7 2SN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 4, "price_paid": 485000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 355, "address_line1": "69 Elm Drive, CW1 4EL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 4, "price_paid": 137500, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 356, "address_line1": "27 Gresty Terrace, CW1 5EN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 110000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 357, "address_line1": "27 Hulme Street, CW1 3PB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 105000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 358, "address_line1": "25 Congleton Road, CW11 1HG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 440000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 359, "address_line1": "37 Marley Avenue, CW1 3SN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 175000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 360, "address_line1": "20 Darlington Street, CW10 9AJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 168000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 361, "address_line1": "19 Dexter Way, CW10 9GH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 345000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 362, "address_line1": "26 Farrier Court, CW1 4NY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 4, "price_paid": 225000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 363, "address_line1": "25 Doddington Road, CW2 8NQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 115000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 364, "address_line1": "42 Mablins Lane, CW1 3RF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 170000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 365, "address_line1": "42 Roman Way, CW11 3EW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 275000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 366, "address_line1": "4 Lawrence Avenue, CW10 9DP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 170000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 367, "address_line1": "5 Moss Fields, ST7 2LA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 210000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 368, "address_line1": "44 Hall Drive, ST7 2UD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 0, "price_paid": 340000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 369, "address_line1": "562 Crewe Road, CW11 3RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 225000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 370, "address_line1": "1 Smallwood Close, CW10 0PP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 302000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 371, "address_line1": "99 Crewe Road, ST7 2JE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 491000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 372, "address_line1": "78 Samuel Street, CW1 3AE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 117000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 373, "address_line1": "260 Booth Lane, CW10 0HA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 199950, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 374, "address_line1": "6 Lea Drive, CW10 0LX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 215000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 375, "address_line1": "18 Lea Close, CW11 4HT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 266000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 376, "address_line1": "24 Remer Street, CW1 4LT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 135000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 377, "address_line1": "7 Valley Close, ST7 2HU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 5, "price_paid": 335000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 378, "address_line1": "10 Beeston Close, CW10 0SH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 227000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 379, "address_line1": "19 Hadrian Way, CW10 9RB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 300000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 380, "address_line1": "29 London Road, CW11 3BE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 147000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 381, "address_line1": "2 Furnival Street, CW11 1DJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 245000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 382, "address_line1": "18 Eardswick Road, CW10 0DT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 155000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 383, "address_line1": "47 Gresty Terrace, CW1 5EN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 80000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 384, "address_line1": "417 West Street, CW1 3HZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 85000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 385, "address_line1": "74 Hassall Road, CW11 4HN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 280000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 386, "address_line1": "12a Gowy Close, ST7 2HX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 215000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 387, "address_line1": "20 Vicarage Gardens, CW11 3BZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 320000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 388, "address_line1": "218 Hungerford Road, CW1 6EX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 151000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 389, "address_line1": "340 Hungerford Road, CW1 6HD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 4, "price_paid": 160000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 390, "address_line1": "6 Pembroke Place, CW10 9QU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 0, "price_paid": 230000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 391, "address_line1": "20 Harbutts Court, CW10 9PU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 155000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 392, "address_line1": "9 Jesmond Crescent, CW2 7NJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 195000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 393, "address_line1": "3 The Brambles, CW1 5RA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 345000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 394, "address_line1": "1 Dane Street, CW10 9EF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 93000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 395, "address_line1": "190 Middlewich Street, CW1 4DL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 199000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 396, "address_line1": "11 Kempton Avenue, CW1 3TB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 160000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 397, "address_line1": "Flat 26 Worsdell House Blount Close, CW1 3BF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 95000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 398, "address_line1": "31 Brynlow Drive, CW10 0PD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 293000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 399, "address_line1": "72 Dunnocksfold Road, ST7 2TW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 545000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 400, "address_line1": "11 Padworth Place, CW1 4TN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 150000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 401, "address_line1": "22 London Road, CW11 3BD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 143000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 402, "address_line1": "14 Lawton Street, CW2 7HZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 110000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 403, "address_line1": "20 Sunnymill Drive, CW11 4NB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 210000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 404, "address_line1": "56 Rolt Crescent, CW10 0BE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 210000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 405, "address_line1": "39 Rushton Drive, CW10 0NJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 265000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 406, "address_line1": "26 Jubilee Pastures, CW10 0AS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 0, "price_paid": 235000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 407, "address_line1": "48 Sandbach Road, ST7 3RN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 157000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 408, "address_line1": "13 Charlesworth Street, CW1 4DE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 133000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 409, "address_line1": "19 Flixton Drive, CW2 8AP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 212000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 410, "address_line1": "331 West Street, CW1 3HU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 69000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 411, "address_line1": "56 Elworth Street, CW11 1HA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 147500, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 412, "address_line1": "18 Chesterton Close, CW10 0RL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 162000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 413, "address_line1": "12 Whirley Close, CW10 0NX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 235000, "date_sold": "Oct 2024", "latitude": null, "longitude": null},
-{"id": 414, "address_line1": "18 Honiton Way, CW10 9QS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 180000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 415, "address_line1": "292 Booth Lane, CW10 0HA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 135000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 416, "address_line1": "93 Remer Street, CW1 4LU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 213000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 417, "address_line1": "18 Moreton Road, CW2 8QU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 170000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 418, "address_line1": "38 Barthomley Crescent, CW2 8TW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 150000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 419, "address_line1": "77 Derwent Close, ST7 2EL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 260000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 420, "address_line1": "31 Vincent Street, CW1 4AA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 82000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 421, "address_line1": "30 Fields Drive, CW11 1YB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 415000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 422, "address_line1": "1 Pelham Close, CW1 5TZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 4, "price_paid": 315000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 423, "address_line1": "27 Portland Grove, CW1 5TY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 190000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 424, "address_line1": "18 Woodland Gardens, CW1 4JS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 215000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 425, "address_line1": "5 Brook Close, CW1 6HR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 200000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 426, "address_line1": "72 Bradfield Road, CW1 3RB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 197000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 427, "address_line1": "6 Monarch Close, CW2 7UF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 150000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 428, "address_line1": "8 Dunoon Close, CW4 7LL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 300000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 429, "address_line1": "19b Clough Walk, CW2 6LL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 57000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 430, "address_line1": "23 Station Road, CW4 7AY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 410000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 431, "address_line1": "20 Charlesworth Street, CW1 4DE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 100000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 432, "address_line1": "54 The Dingle, CW1 5SD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 300000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 433, "address_line1": "69 Heathend Road, ST7 2SH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 250000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 434, "address_line1": "9 Bidvale Way, CW1 4NU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 80000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 435, "address_line1": "173 Crewe Road, CW1 5RL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 170000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 436, "address_line1": "121 Bradwall Road, CW11 1AW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 185000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 437, "address_line1": "2 Benjafield Court, CW1 3GL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 200000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 438, "address_line1": "292 Alton Street, CW2 7RY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 120000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 439, "address_line1": "8 George Vi Close, CW10 0DF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 133000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 440, "address_line1": "3 Valley Close, ST7 2HU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 320000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 441, "address_line1": "2 Betley Street, CW1 2LE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 119000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 442, "address_line1": "29 Summer Drive, CW11 4EJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 1, "price_paid": 90000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 443, "address_line1": "5 Franklyn Avenue, CW2 7NF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 212500, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 444, "address_line1": "23 Heath Road, CW11 2JD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 230000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 445, "address_line1": "6 Sutton Lane, CW10 9AU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 1, "price_paid": 100000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 446, "address_line1": "7 Grenville Close, CW1 5TU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 270000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 447, "address_line1": "10 St Johns Way, CW11 2LY", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 315000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 448, "address_line1": "22 Sandown Road, CW1 3TF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 195000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 449, "address_line1": "6 Tollitt Street, CW1 2LD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 125000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 450, "address_line1": "4 Malt Kiln Way, CW11 1JL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 270000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 451, "address_line1": "5 Harbutts Court, CW10 9PU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 0, "price_paid": 98000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 452, "address_line1": "11 Melrose Drive, CW1 3YD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 225000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 453, "address_line1": "13 Dee Close, CW11 1XJ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 260000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 454, "address_line1": "12 Oakland Avenue, CW1 5PB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 135500, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 455, "address_line1": "5 Warmingham Road, CW1 4PU", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 345000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 456, "address_line1": "11 Cranebrook Close, CW1 3YW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 267000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 457, "address_line1": "217 Middlewich Street, CW1 4DN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 120000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 458, "address_line1": "2 St Matthews Close, CW1 5TW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 3, "price_paid": 240000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 459, "address_line1": "5 Tytherington Close, CW10 0NN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 3, "price_paid": 240000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 460, "address_line1": "39 Coleridge Way, CW1 5JW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 170000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 461, "address_line1": "82 Queens Park Gardens, CW2 7SW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 1, "price_paid": 60000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 462, "address_line1": "17 Teal Drive, CW11 3JT", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 0, "price_paid": 272000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 463, "address_line1": "207 Ford Lane, CW1 3JH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 215000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 464, "address_line1": "6 Peter Fletcher Crescent, CW11 3AP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 0, "price_paid": 215000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 465, "address_line1": "14 Flavian Close, CW10 9RE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 260000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 466, "address_line1": "17 Elm Drive, CW4 7QA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 4, "price_paid": 430000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 467, "address_line1": "21 Newfield Street, CW11 1HE", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 222500, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 468, "address_line1": "210 Henry Street, CW1 4BG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 110000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 469, "address_line1": "98 St Anns Road, CW10 9BZ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 320000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 470, "address_line1": "29 Chartley Grove, CW10 9GG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 200000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 471, "address_line1": "39 Lime Tree Avenue, CW1 4HN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 152500, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 472, "address_line1": "7 Maple Close, CW11 4JL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 268000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 473, "address_line1": "Flat 8 Mere Court Sandbach Road North, ST7 2AP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 210000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 474, "address_line1": "8 Hollycroft, CW12 4SH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 5, "price_paid": 565000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 475, "address_line1": "24 Elmstead Crescent, CW1 3PX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 350000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 476, "address_line1": "2 Burns Drive, CW1 5JP", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 165000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 477, "address_line1": "20 Henry Street, CW1 5PS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 210000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 478, "address_line1": "14 Laxton Way, CW10 9EN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace_bungalow", "num_beds": 2, "price_paid": 130000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 479, "address_line1": "8 Culland Street, CW2 6DQ", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 112000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 480, "address_line1": "16 Wrenmere Close, CW11 1XS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 440000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 481, "address_line1": "14 Byron Close, CW10 0RD", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 185000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 482, "address_line1": "22 Sunnymill Drive, CW11 4NB", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 220000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 483, "address_line1": "22 Ettiley Avenue, CW11 3ND", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 210000, "date_sold": "Sep 2024", "latitude": null, "longitude": null},
-{"id": 484, "address_line1": "30 Bedford Street, CW2 6JA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 105000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 485, "address_line1": "40 Capenhurst Avenue, CW2 8NN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 170000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 486, "address_line1": "59 Richard Street, CW1 3AG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 107500, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 487, "address_line1": "205 Middlewich Street, CW1 4DN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 119000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 488, "address_line1": "4 Wrights Lane, CW11 2JX", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 155000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 489, "address_line1": "47 Sutton Lane, CW10 0AH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 158000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 490, "address_line1": "37 Hind Heath Road, CW11 3LG", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d_bungalow", "num_beds": 2, "price_paid": 268000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 491, "address_line1": "20 Eastgate Road, CW4 7BW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 2, "price_paid": 260000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 492, "address_line1": "4 Browning Close, CW11 3ZH", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 295000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 493, "address_line1": "10 The Windings, CW10 9GW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached", "num_beds": 4, "price_paid": 365000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 494, "address_line1": "46 St Anns Road, CW10 9BN", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 295000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 495, "address_line1": "1 Russell Avenue, ST7 2BL", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "detached_bungalow", "num_beds": 3, "price_paid": 295000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 496, "address_line1": "18 Walthall Street, CW2 7LA", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 2, "price_paid": 135000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 497, "address_line1": "6 Dean Street, CW10 9DW", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "terrace", "num_beds": 3, "price_paid": 125000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 498, "address_line1": "13 Waterloo Road, CW1 5TF", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 2, "price_paid": 240000, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 499, "address_line1": "Flat 15 Embury Court Welles Street, CW11 1JR", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "flat", "num_beds": 2, "price_paid": 112500, "date_sold": "Aug 2024", "latitude": null, "longitude": null},
-{"id": 500, "address_line1": "26 Henry Street, CW1 5PS", "town": "Sandbach", "postcode": "CW1", "outcode": "CW1", "property_type": "semi_d", "num_beds": 3, "price_paid": 253000, "date_sold": "Aug 2024", "latitude": null, "longitude": null}]
+    def __init__(self) -> None:
+        self.properties = load_fixture()
 
-    async def execute(self, query: str) -> dict[str, Any] | None:
-        """Execute deterministic keyword-based search."""
-        # Simple keyword matching for fallback mode
-        q = query.lower()
-        
-        matches = [p for p in self.mock_properties if any(keyword in q for keyword in 
-            ["bed", "property", "house", "home", "apartment", "flat", "mansion"])]
+    async def execute(self, query: str, parsed=None) -> dict[str, Any] | None:
+        from .ingestion.agent_store import listing_store
+        from .parser import _deterministic_parse
 
-        # Filter by price if mentioned in query
-        import re
-        price_match = re.search(r'(?:under|below|max)\s*£?(\d+)', q)
-        if price_match:
-            max_price = int(price_match.group(1).replace("k", "")) * 1000
-            matches = [p for p in matches if p.get("price_paid", 0) <= max_price]
+        # Fixture data plus anything agents have uploaded.
+        properties = list(self.properties) + listing_store.all_listings()
+        if not properties:
+            return None
+
+        # Callers may pass filters parsed from explicit query parameters; they
+        # take precedence over re-parsing the free-text query.
+        parsed = parsed or _deterministic_parse(query)
+        matches = properties
+
+        def price_of(property_row: dict) -> float:
+            # Live listings carry an asking price; sold records carry price_paid.
+            return float(
+                property_row.get("asking_price")
+                or property_row.get("price_paid")
+                or 0
+            )
+
+        if parsed.min_beds is not None:
+            matches = [p for p in matches if (p.get("num_beds") or 0) >= parsed.min_beds]
+        if parsed.max_beds is not None:
+            matches = [p for p in matches if (p.get("num_beds") or 0) <= parsed.max_beds]
+        if parsed.max_price is not None:
+            matches = [p for p in matches if price_of(p) <= parsed.max_price]
+        if parsed.location:
+            location = parsed.location.lower()
+            matches = [p for p in matches if location in (p.get("town") or "").lower()]
+        if parsed.outcode:
+            outcode = parsed.outcode.upper()
+            matches = [p for p in matches if (p.get("outcode") or "").upper() == outcode]
+        if parsed.property_types:
+            wanted = {t.value for t in parsed.property_types}
+            matches = [p for p in matches if p.get("property_type") in wanted]
+
+        # When the query carried no structured filters, fall back to a simple
+        # token match over address/town/description. This is what makes a
+        # freshly uploaded listing findable by name in demo mode.
+        if not any(
+            (
+                parsed.min_beds is not None,
+                parsed.max_beds is not None,
+                parsed.max_price is not None,
+                parsed.location,
+                parsed.outcode,
+                parsed.property_types,
+            )
+        ):
+            tokens = [
+                token
+                for token in re.findall(r"[a-z0-9]{3,}", query.lower())
+                if token not in SEARCH_STOPWORDS
+            ]
+            if tokens:
+                matches = [
+                    p for p in matches
+                    if all(token in _search_blob(p) for token in tokens)
+                ]
 
         return {
             "tier": self.name,
             "properties": matches[:50],
             "total_matches": len(matches),
-            "message": f"Found {len(matches)} properties using deterministic search",
+            "message": f"Found {len(matches)} demo properties (fixture data)",
         }
 
 
 class QueryRouter:
-    """Route queries through a chain of providers with degradation.
-
-    Provider priority (production to dev fallback):
-    1. Semantic cache hit (~20ms)
-    2. pgvector hybrid search (~50-200ms) 
-    3. Deterministic filter-only (~5ms) - for dev mode without DB
-    4. Forced deterministic fallback with mock data
-
-    Providers are called in order; the first to return a non-empty result wins.
-    On complete failure, returns a forced-deterministic fallback.
-    """
+    """Try providers in order, caching successful results."""
 
     def __init__(self, cache=None) -> None:
         self.providers: list = []
         self.cache = cache
 
     def add_provider(self, provider) -> None:
-        """Register a search provider."""
         self.providers.append(provider)
 
     async def route(self, query: str) -> dict:
-        """Run the provider chain and return the best result."""
-        # Check semantic cache first (~20ms)
-        cached = await self.cache.get(query) if self.cache else None
-        if cached:
-            return {**cached, "tier": "semantic-cache"}
+        if self.cache:
+            cached = await self.cache.get(query)
+            if cached:
+                return {**cached, "tier": "semantic-cache"}
 
         for provider in self.providers:
             try:
                 result = await provider.execute(query)
-                if result and (result.get("results") or result.get("properties")):
-                    if self.cache:
-                        await self.cache.put(query, result)
-                    return {**result, "tier": getattr(provider, "name", "unknown")}
-            except Exception as e:
-                print(f"[QueryRouter] Provider error: {e}")
+            except Exception as exc:  # noqa: BLE001 - keep the chain alive
+                logger.warning("[QueryRouter] provider %r failed: %s", provider, exc)
                 continue
 
-        # Fallback: add deterministic provider if not already added and no pool available
-        has_pool = any(getattr(p, 'pool', None) for p in self.providers)
-        if not has_pool:
-            deterministic_provider = DeterministicSearchProvider()
-            result = await deterministic_provider.execute(query)
-            if result:
-                return {**result, "tier": "deterministic-fallback"}
+            if not result:
+                continue
 
-        # Last resort: empty results with message
+            # A provider that returns zero rows is a valid answer when it has a
+            # database; only treat "no payload" as a miss.
+            if self.cache:
+                await self.cache.put(query, result)
+            return {**result, "tier": getattr(provider, "name", "unknown")}
+
         return {
-            "tier": "forced-deterministic", 
+            "tier": "no-provider",
             "results": [],
-            "message": "No search providers available. Configure DATABASE_URL for full functionality."
+            "properties": [],
+            "total_matches": 0,
+            "message": "No search providers available. Configure DATABASE_URL.",
         }
 
 
+def demo_data_enabled() -> bool:
+    """Demo fixture data is opt-in and never enabled in production."""
+    if os.getenv("NODE_ENV") == "production":
+        return False
+    return os.getenv("DEMO_DATA", "true").strip().lower() in {"1", "true", "yes"}
+
+
 def build_providers(pool=None, embedder=None) -> list:
-    """Build the default provider list.
+    """Build the provider chain for this process."""
+    providers: list = []
 
-    In production this wires up a real pgvector-backed search provider.
-    Returns an empty list when no database pool is available (dev/test mode).
-    Includes fallback provider for dev experience without DB setup.
-    """
-    if pool is None:
-        # No pool = use deterministic fallback provider only
-        return [DeterministicSearchProvider()]
-    
-    # Production mode with PostgreSQL
-    providers = [SearchProvider(pool=pool, embedder=embedder)]
+    if pool is not None:
+        providers.append(SearchProvider(pool=pool, embedder=embedder))
 
-    # Always add deterministic fallback for graceful degradation
-    providers.append(DeterministicSearchProvider())
-    
+    if demo_data_enabled():
+        providers.append(DeterministicSearchProvider())
+
     return providers
-
-
-def search_fn(parsed, message, pool=None):
-    """Search entry point — uses repository layer. Deprecated: use search.search instead."""
-    raise NotImplementedError("Use search.search() or QueryRouter instead")

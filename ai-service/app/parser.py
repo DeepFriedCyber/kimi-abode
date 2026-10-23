@@ -1,4 +1,9 @@
-"""Natural-language query parser with tiered failover."""
+"""Natural-language query parser with tiered failover.
+
+The deterministic tier handles the common cases ("3 bed semi in Sandbach under
+£250k") without an LLM. Extraction is ordered and allocation-free so the same
+query always produces the same filters.
+"""
 
 from __future__ import annotations
 
@@ -7,154 +12,235 @@ from enum import IntEnum, auto
 
 from .schemas import ParsedQuery, PropertyType
 
+# ---------- Numeric filters ----------------------------------------------
+BED_RANGE_PATTERN = re.compile(
+    r"\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s*-?\s*bed(?:room)?s?\b", re.I
+)
+BED_PATTERN = re.compile(r"\b(\d{1,2})\s*-?\s*bed(?:room)?s?\b", re.I)
 
-# ---------- Bed types ---------------------------------------------------
-BED_PATTERNS = [
-    (re.compile(r"\b(\d+)[\s-]+\d+(?:[\s-]+(?:to|-|–)?)?\s*bed(?:room)?s?\b", re.I), "range_beds"),
-    (re.compile(r"\b(\d+)\s*bed(?:room)?s?\b", re.I), "min_beds"),
-]
-
-# ---------- Price patterns -----------------------------------------------
+# "under £250k", "up to 300,000", "budget of £1.2m"
 PRICE_PATTERN = re.compile(
-    r"(?:under|below|less than|max\s+£|up\s+to)\s*£?([\d,.]+)[kKmM]?"
+    r"(?:under|below|less\s+than|up\s+to|max(?:imum)?|budget(?:\s+of)?)"
+    r"\s*£?\s*([\d][\d,]*(?:\.\d+)?)\s*([kKmM])?",
+    re.I,
 )
 
-# ---------- Location keywords ---------------------------------------------
-LOCATION_KEYWORDS = {
-    "in", "near", "around", "close to", "within", "south", "north",
-    "east", "west", "southwest", "southeast", "northwest", "northeast",
+# A bare "£250k" is treated as a budget.
+BARE_PRICE_PATTERN = re.compile(r"£\s*([\d][\d,]*(?:\.\d+)?)\s*([kKmM])?", re.I)
+
+# ---------- Location keywords (longest first — order is significant) ------
+LOCATION_KEYWORDS = [
+    "close to", "southwest", "southeast", "northwest", "northeast",
+    "within", "around", "near", "south", "north", "east", "west", "in",
+]
+LOCATION_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in LOCATION_KEYWORDS) + r")\b", re.I
+)
+
+# Words that should never become part of a town name.
+NON_LOCATION_WORDS = {
+    "under", "below", "less", "than", "up", "to", "max", "maximum", "budget",
+    "about", "approx", "approximately", "and", "with", "for", "the", "a", "an",
+    "bed", "beds", "bedroom", "bedrooms", "house", "home", "property",
+    "properties", "flat", "apartment", "apartments", "detached", "semi",
+    "terraced", "terrace", "bungalow", "maisonette", "good", "great", "nice",
+    "area", "areas", "town", "village", "city", "centre", "center",
 }
 
-# ---------- Type patterns (sorted longest-first so compound matches win) ---
-TYPE_PATTERNS: list[tuple[re.Pattern, PropertyType]] = [
-    (re.compile(r"semi[-\s]detached", re.I), PropertyType.SEMI_DETACHED),
-    (re.compile(r"m\s?a\s?i\s?s\s?o\s?n\s?e\s?t\s?t\s?", re.I), PropertyType.MAISONETTE),
+# ---------- Type patterns (compound matches are listed first) -------------
+TYPE_PATTERNS: list[tuple[re.Pattern[str], PropertyType]] = [
+    (re.compile(r"semi[-\s]?detached", re.I), PropertyType.SEMI_DETACHED),
+    (re.compile(r"maisonette", re.I), PropertyType.MAISONETTE),
     (re.compile(r"\bbungalow\b", re.I), PropertyType.BUNGALOW),
-    (re.compile(r"\bflats?\b", re.I), PropertyType.FLAT),
+    (re.compile(r"\bflats?\b|\bapartments?\b", re.I), PropertyType.FLAT),
     (re.compile(r"\bdetached\b", re.I), PropertyType.DETACHED),
     (re.compile(r"\bterraced\b|\bterrace\b", re.I), PropertyType.TERRACED),
 ]
 
+OUTCODE_PATTERN = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*\d[A-Z]{2}\b", re.I)
+
+MIN_PRICE = 1_000
+MAX_PRICE = 50_000_000
+MAX_BEDS = 20
+
 
 class Tier(IntEnum):
-    DETERMINISTIC = auto()  # high-confidence structured parse
-    LLM_1 = auto()           # primary provider
-    LLM_2 = auto()           # failover provider
-    SEMANTIC_CACHE = auto()  # cached result
-    FORCED_DETERMINISTIC = auto()  # total LLM outage fallback
+    DETERMINISTIC = auto()
+    LLM_1 = auto()
+    LLM_2 = auto()
+    SEMANTIC_CACHE = auto()
+    FORCED_DETERMINISTIC = auto()
 
 
 async def parse_query(query: str, *, llm_parse=None) -> ParsedQuery:
-    """Parse a natural-language query. Returns result even when price found."""
+    """Parse a query deterministically, falling back to an LLM only when the
+    deterministic tier finds no structured signal."""
     result = _deterministic_parse(query)
 
-    # Fall back to LLM for complex queries (no location or price detected)
     if not result.has_location and not result.has_price and llm_parse:
         try:
             llm_result = await llm_parse(query)
-            return ParsedQuery(
-                **{**llm_result, "tier": Tier.LLM_1.name},
-                raw=query,
-            )
-        except Exception:
+            return ParsedQuery(**{**llm_result, "tier": Tier.LLM_1.name}, raw=query)
+        except Exception:  # noqa: BLE001 - fall back to deterministic result
             pass
 
     return ParsedQuery(**{**result.model_dump(), "tier": Tier.DETERMINISTIC.name})
 
 
-def _deterministic_parse(query: str) -> ParsedQuery:
-    """Extract structured fields from natural language using regex heuristics."""
-    q_lower = query.lower()
+def _parse_number(raw: str, suffix: str | None) -> float:
+    """Convert '250,000' + 'k' into a float, rejecting implausible values."""
+    value = float(raw.replace(",", ""))
+    if suffix:
+        if suffix.lower() == "k":
+            value *= 1_000
+        elif suffix.lower() == "m":
+            value *= 1_000_000
+    return value
 
-    # --- beds ---------------------------------------------------------------
-    min_beds: int | None = None
-    for pattern, field in BED_PATTERNS:
-        m = pattern.search(query)
-        if m:
-            val = m.group(1).replace(",", "")
-            min_beds = int(val)
+
+def _extract_beds(query: str) -> tuple[int | None, int | None]:
+    """Return (min_beds, max_beds) from '3 bed' or '1-4 bedroom'."""
+    range_match = BED_RANGE_PATTERN.search(query)
+    if range_match:
+        low, high = int(range_match.group(1)), int(range_match.group(2))
+        low, high = min(low, high), max(low, high)
+        if 0 <= low <= MAX_BEDS and 0 <= high <= MAX_BEDS:
+            return low, high
+        return None, None
+
+    single = BED_PATTERN.search(query)
+    if single:
+        value = int(single.group(1))
+        if 0 <= value <= MAX_BEDS:
+            return value, None
+
+    return None, None
+
+
+def _extract_price(query: str) -> tuple[float | None, float | None, bool]:
+    """Return (min_price, max_price, has_price)."""
+    match = PRICE_PATTERN.search(query)
+    if not match:
+        bare = BARE_PRICE_PATTERN.search(query)
+        if not bare:
+            return None, None, False
+        value = _parse_number(bare.group(1), bare.group(2))
+        return None, value, _plausible_price(value)
+
+    value = _parse_number(match.group(1), match.group(2))
+    if not _plausible_price(value):
+        return None, None, False
+    return None, value, True
+
+
+def _plausible_price(value: float) -> bool:
+    return MIN_PRICE <= value <= MAX_PRICE
+
+
+def _extract_types(query: str) -> list[PropertyType]:
+    """Match property types, preferring the longest non-overlapping match."""
+    found: list[PropertyType] = []
+    spans: list[tuple[int, int]] = []
+
+    for pattern, property_type in TYPE_PATTERNS:
+        for match in pattern.finditer(query):
+            if any(not (match.end() <= start or match.start() >= end) for start, end in spans):
+                continue
+            found.append(property_type)
+            spans.append((match.start(), match.end()))
+            break  # one match per pattern is enough
+
+    return found
+
+
+def _excluded_spans(query: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for pattern in (BED_RANGE_PATTERN, BED_PATTERN, PRICE_PATTERN):
+        spans.extend((m.start(), m.end()) for m in pattern.finditer(query))
+    return spans
+
+
+def _inside_span(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def _candidate_words(query: str, start: int, limit: int = 3) -> list[str]:
+    """Collect up to `limit` usable words following a location keyword."""
+    tail = query[start:].strip()
+    words: list[str] = []
+
+    for raw in tail.split():
+        word = raw.strip(".,;:!?()\"'")
+        if not word:
+            continue
+        lowered = word.lower()
+        if (
+            len(word) <= 2
+            or lowered in NON_LOCATION_WORDS
+            or lowered in LOCATION_KEYWORDS
+            or re.match(r"^[\d£$€]", word)
+        ):
+            # Stop at the first non-location token; continuing would pull in
+            # unrelated text ("in Sandbach under 300k").
+            break
+        words.append(word)
+        if len(words) >= limit:
             break
 
-    # --- price --------------------------------------------------------------
-    max_price: float | None = None
-    pm = PRICE_PATTERN.search(q_lower)
-    has_price = False
-    if pm:
-        raw_val = pm.group(1).replace(",", "")
-        # Check for k/m suffix directly on the full matched text
-        multiplier = 1.0
-        match_text = pm.group(0).lower()
-        if match_text.endswith("k"):
-            multiplier = 1000
-        elif match_text.endswith("m"):
-            multiplier = 1_000_000
+    return words
 
-        max_price = float(raw_val) * multiplier
-        has_price = True
 
-    # --- property types (compound-aware; longest match wins, skip subsumed) --
-    found_types: list[PropertyType] = []
-    matched_spans: list[tuple[int, int]] = []
-    for pattern, ptype in TYPE_PATTERNS:
-        m = pattern.search(query)
-        if m:
-            overlaps = any(not (m.end() <= s or m.start() >= e) for s, e in matched_spans)
-            if not overlaps:
-                found_types.append(ptype)
-                matched_spans.append((m.start(), m.end()))
+def _extract_location(query: str) -> str | None:
+    """Pick the location keyword whose candidate town ends latest in the query."""
+    excluded = _excluded_spans(query)
+    best: tuple[int, str] | None = None
 
-    # --- location -----------------------------------------------------------
-    location: str | None = None
-    district: str | None = None
-    outcode: str | None = None
-    has_location = False
-
-    # Find position boundaries for beds and price patterns
-    bed_end = 0
-    for pattern, field in BED_PATTERNS:
-        m = pattern.search(query)
-        if m and m.end() > bed_end:
-            bed_end = m.end()
-    price_start = len(q_lower)  # default: no price found
-    pm_price = PRICE_PATTERN.search(q_lower)
-    if pm_price:
-        price_start = pm_price.start()
-
-    # Look for LOCATION_KEYWORDS between bed_end and price_start
-    best_loc_end = 0
-    PRICE_WORDS = {"under", "below", "max", "up", "to", "about", "approx", "around"}
-    for kw in LOCATION_KEYWORDS:
-        idx = q_lower.find(kw, bed_end)
-        if idx == -1 or idx + len(kw) > price_start:
+    for match in LOCATION_PATTERN.finditer(query):
+        if _inside_span(match.start(), excluded):
             continue
-        after = query[idx + len(kw):].strip().split()
-        filtered = [w for w in after if not re.match(r"^[\d£$€]", w) and len(w) > 2 and w.lower() not in LOCATION_KEYWORDS and w.lower() not in PRICE_WORDS]
-        candidate = " ".join(filtered[:3])
-        if candidate and len(candidate) > 2 and (idx + len(kw)) > best_loc_end:
-            best_loc_end = idx + len(kw)
-            location = candidate.title()
-            has_location = True
+        words = _candidate_words(query, match.end())
+        if not words:
+            continue
+        candidate = " ".join(words)
+        if best is None or match.end() > best[0]:
+            best = (match.end(), candidate.title())
 
-    # Check for UK postcode outcode
-    pc_match = re.search(r"\b([A-Z]{1,2}\d[A-Z]?)\s*\d", query, re.I)
-    if pc_match:
-        outcode = pc_match.group(1).upper()
-        # If location wasn't found but we have an outcode that maps to a town, use gazetteer
-        from .gazetteer import outcode_to_town
-        town_from_outcode = outcode_to_town(outcode)
-        if town_from_outcode and not has_location:
-            location = town_from_outcode
-            has_location = True
+    return best[1] if best else None
+
+
+def _deterministic_parse(query: str) -> ParsedQuery:
+    """Extract structured fields from natural language using regex heuristics."""
+    query = (query or "").strip()
+
+    min_beds, max_beds = _extract_beds(query)
+    min_price, max_price, has_price = _extract_price(query)
+    property_types = _extract_types(query)
+
+    location = _extract_location(query)
+    district = None
+    outcode = None
+
+    postcode_match = OUTCODE_PATTERN.search(query)
+    if postcode_match:
+        outcode = postcode_match.group(1).upper()
+        if not location:
+            from .gazetteer import outcode_to_town
+
+            town = outcode_to_town(outcode)
+            if town:
+                location = town
 
     return ParsedQuery(
         raw=query,
-        tier="",  # filled by caller with tier name
+        tier="",
         min_beds=min_beds,
+        max_beds=max_beds,
+        min_price=min_price,
         max_price=max_price,
-        property_types=found_types,
+        property_types=property_types,
         location=location,
         district=district,
         outcode=outcode,
-        has_location=has_location,
+        has_location=bool(location or outcode),
         has_price=has_price,
     )

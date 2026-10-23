@@ -1,14 +1,18 @@
-"""Semantic cache — similarity-thresholded caching for search & chat."""
+"""Semantic cache — similarity-thresholded caching for search & chat.
+
+Entries are keyed by (context, query). `context` exists so a chat answer cached
+for one property is never served for another, and so search results with
+different filters do not collide.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
@@ -21,9 +25,10 @@ class CacheEntry:
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    if not a or not b:
+    """Cosine similarity between two equal-length vectors."""
+    if not a or not b or len(a) != len(b):
         return 0.0
+
     dot = sum(x * y for x, y in zip(a, b))
     mag_a = sum(x * x for x in a) ** 0.5
     mag_b = sum(x * x for x in b) ** 0.5
@@ -32,157 +37,161 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (mag_a * mag_b)
 
 
-def _hash_bucket(text: str, bucket_count: int = 256) -> int:
-    """Hash text into one of several buckets for fast pre-filtering."""
-    h = hashlib.md5(text.lower().encode()).hexdigest()
-    return int(h[:4], 16) % bucket_count
+def cache_key(context: str, query: str) -> str:
+    """Stable key for a (context, query) pair."""
+    return f"{context.strip().lower()}\x1f{query.strip().lower()}"
 
 
 class InMemorySemanticCache:
-    """Simple in-memory cache with cosine-similarity lookups.
+    """LRU + TTL cache with optional cosine-similarity lookup.
 
-    Uses hash-based bucket pre-filtering to avoid full-store scans at scale.
-    Evicts entries that exceed max_size or are older than ttl_seconds (LRU).
+    Lookup is O(n) over live entries. That is acceptable for the default
+    `max_size` (1 000) and a single process; move to pgvector/Redis before
+    raising it. The previous docstring claimed hash-bucketed pre-filtering that
+    was never implemented.
     """
 
     def __init__(
         self,
         embedder=None,
-        threshold: float = 0.85,
-        ttl_seconds: int = 3600,
-        max_size: int = 10_000,
+        threshold: float = 0.9,
+        ttl_seconds: int = 3_600,
+        max_size: int = 1_000,
     ):
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError("threshold must be in (0, 1]")
+        if max_size < 1:
+            raise ValueError("max_size must be >= 1")
+
         self._store: OrderedDict[str, CacheEntry] = OrderedDict()
-        self.threshold = threshold
         self._embedder = embedder
+        self.threshold = threshold
         self.ttl_seconds = ttl_seconds
         self.max_size = max_size
-        self._bucket_count = 256
 
-    def _evict_expired(self) -> None:
-        """Remove entries past their TTL."""
+    # -- internals ---------------------------------------------------------
+    def _is_live(self, entry: CacheEntry, now: float) -> bool:
+        return (now - entry.created_at) < self.ttl_seconds
+
+    def _evict(self, now: float) -> None:
+        for key in [k for k, e in self._store.items() if not self._is_live(e, now)]:
+            del self._store[key]
+
+    def _enforce_capacity(self) -> None:
+        while len(self._store) >= self.max_size:
+            self._store.popitem(last=False)  # oldest / least recently used
+
+    # -- public API --------------------------------------------------------
+    async def get(self, query: str, *, context: str = "") -> dict | None:
+        """Return a cached result, exact match first then semantic match."""
         now = time.time()
-        expired_keys = [
-            k for k, e in self._store.items()
-            if now - e.created_at > self.ttl_seconds
-        ]
-        for k in expired_keys:
-            del self._store[k]
+        self._evict(now)
 
-    def _evict_if_needed(self) -> None:
-        """Evict oldest entries when the store has exceeded max_size."""
-        while len(self._store) >= self.max_size:
-            # OrderedDict.popitem(last=False) removes the oldest entry (FIFO/LRU)
-            self._store.popitem(last=False)
-
-    def _find_exact_match(self, query_lower: str) -> str | None:
-        """Find exact case-insensitive match among surviving entries."""
-        for key in self._store:
-            if key.lower() == query_lower:
-                entry = self._store[key]
-                if time.time() - entry.created_at <= self.ttl_seconds:
-                    return key
-                del self._store[key]
-        return None
-
-    async def get(self, query: str) -> dict | None:
-        """Look up a cached result by semantic similarity."""
-        query_lower = query.lower()
-        self._evict_expired()
-
-        # Enforce max_size on every lookup so the cache never overflows when
-        # callers bypass put() (e.g. direct InMemorySemanticCache usage).
-        while len(self._store) >= self.max_size:
-            self._store.popitem(last=False)  # remove LRU (oldest)
-
-        # Fast path: exact match (also handles TTL)
-        key = self._find_exact_match(query_lower)
-        if key:
-            entry = self._store[key]
+        key = cache_key(context, query)
+        entry = self._store.get(key)
+        if entry and self._is_live(entry, now):
             entry.hit_count += 1
             self._store.move_to_end(key)
-            return entry.result
+            return json.loads(json.dumps(entry.result))  # defensive copy
 
-        # Slow path: semantic match — compare against all surviving entries
         if not self._embedder:
             return None
 
-        q_emb = await self._embedder.embed(query)
+        query_embedding = await self._embedder.embed(query)
+        best_key: str | None = None
+        best_similarity = 0.0
 
-        best_sim = 0.0
-        best_key = None
-        for key, entry in self._store.items():
-            if time.time() - entry.created_at > self.ttl_seconds:
+        for candidate_key, candidate in self._store.items():
+            if not self._is_live(candidate, now) or not candidate.embedding:
                 continue
-            if not entry.embedding:
-                continue
-            sim = _cosine_sim(q_emb, entry.embedding)
-            if sim > best_sim:
-                best_sim = sim
-                best_key = key
+            similarity = _cosine_sim(query_embedding, candidate.embedding)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_key = candidate_key
 
-        if best_key and best_sim >= self.threshold:
-            entry = self._store.pop(best_key)  # move to end
-            entry.hit_count += 1
-            self._store[best_key] = entry
-            return entry.result
-        return None
+        if best_key is None or best_similarity < self.threshold:
+            return None
 
-    async def put(self, query: str, result: dict):
-        """Cache a search result with its embedding."""
-        emb = []
+        hit = self._store.pop(best_key)
+        hit.hit_count += 1
+        self._store[best_key] = hit
+        return json.loads(json.dumps(hit.result))
+
+    async def put(self, query: str, result: dict, *, context: str = "") -> None:
+        """Store a result, embedding the query when an embedder is configured."""
+        embedding: list[float] = []
         if self._embedder:
-            emb = await self._embedder.embed(query)
-        entry = CacheEntry(query=query, result=result, embedding=emb)
+            try:
+                embedding = await self._embedder.embed(query)
+            except Exception:  # noqa: BLE001 - caching must never break a request
+                embedding = []
 
-        # Remove existing entry for same query (case-insensitive)
-        query_lower = query.lower()
-        existing_key = next(
-            (k for k in self._store if k.lower() == query_lower), None
-        )
-        if existing_key:
-            del self._store[existing_key]
+        key = cache_key(context, query)
+        self._store.pop(key, None)
+        self._enforce_capacity()
+        self._store[key] = CacheEntry(query=query, result=result, embedding=embedding)
 
-        # Evict oldest entries if at capacity
-        while len(self._store) >= self.max_size:
-            self._store.popitem(last=False)  # remove LRU (oldest)
-
-        self._store[query] = entry
-
-    def clear(self):
+    def clear(self) -> None:
         self._store.clear()
+
+    def __len__(self) -> int:
+        return len(self._store)
 
 
 class PostgresChatCache:
-    """pgvector-backed chat cache using the embeddings table."""
+    """pgvector-backed chat cache.
 
-    def __init__(self, pool, embedder=None):
+    Uses cosine distance with a maximum-distance guard so an unrelated question
+    cannot be served from cache.
+    """
+
+    def __init__(self, pool, embedder=None, max_distance: float = 0.15):
         self.pool = pool
         self.embedder = embedder
+        self.max_distance = max_distance
 
-    async def get(self, query: str) -> dict | None:
-        if not self.pool:
+    def _cache_text(self, query: str, context: str) -> str:
+        return f"[{context.strip().lower()}] {query.strip()}" if context else query.strip()
+
+    async def get(self, query: str, *, context: str = "") -> dict | None:
+        if not self.pool or not self.embedder:
             return None
-        emb = await self.embedder.embed(query) if self.embedder else [0.0] * 768
+
+        embedding = await self.embedder.embed(self._cache_text(query, context))
         sql = """
-            SELECT result FROM chat_cache
-            ORDER BY embedding <=> $1
+            SELECT result, embedding <=> $1::vector AS distance
+            FROM chat_cache
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1::vector
             LIMIT 1
         """
+        vector = "[" + ",".join(f"{value:.6f}" for value in embedding) + "]"
+
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(sql, str(emb))
-        if row:
-            return row["result"]
+            row = await conn.fetchrow(sql, vector)
+
+        if row and float(row["distance"]) <= self.max_distance:
+            result = row["result"]
+            return json.loads(result) if isinstance(result, str) else dict(result)
         return None
 
-    async def put(self, query: str, result: dict):
+    async def put(self, query: str, result: dict, *, context: str = "") -> None:
         if not self.pool or not self.embedder:
             return
-        emb = await self.embedder.embed(query)
+
+        text = self._cache_text(query, context)
+        embedding = await self.embedder.embed(text)
+        vector = "[" + ",".join(f"{value:.6f}" for value in embedding) + "]"
+
         sql = """
             INSERT INTO chat_cache (query, embedding, result)
-            VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+            VALUES ($1, $2::vector, $3::jsonb)
+            ON CONFLICT DO NOTHING
         """
         async with self.pool.acquire() as conn:
-            vec_str = f"[{','.join(f'{v:.6f}' for v in emb)}]"
-            await conn.execute(sql, query, vec_str, json.dumps(result))
+            await conn.execute(sql, text, vector, json.dumps(result))
+
+
+def hash_text(text: str) -> str:
+    """Small helper for callers that need a deterministic key."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
