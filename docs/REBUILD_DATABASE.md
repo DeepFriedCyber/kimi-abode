@@ -14,7 +14,7 @@ DATABASE_URL=sqlite:./api/data.db
 
 To use PostgreSQL (for full vector search, persistence, scalability):
 ```env
-DATABASE_URL=postgresql://abode:REDACTED-POSTGRES-PASSWORD@localhost:5432/abode
+DATABASE_URL=postgresql://abode:<ROTATE-ME-db-password>@localhost:5432/abode
 ```
 
 **Issue:** Authentication failures due to misconfigured `pg_hba.conf`
@@ -47,7 +47,7 @@ netstat -ano | findstr :5432
    - Owner: `postgres` (or leave default)
 3. Right-click **Roles** → **Create** → **Role**
    - Name: `abode`
-   - Login/Password: `REDACTED-POSTGRES-PASSWORD`
+   - Login/Password: `<ROTATE-ME-db-password>`
    - Privileges: Read/Write to database
 
 #### Option B: Using psql Command Line
@@ -58,7 +58,7 @@ psql -U postgres -d postgres
 
 # Inside psql prompt:
 CREATE DATABASE abode;
-CREATE USER abode WITH PASSWORD 'REDACTED-POSTGRES-PASSWORD';
+CREATE USER abode WITH PASSWORD '<ROTATE-ME-db-password>';
 GRANT ALL PRIVILEGES ON DATABASE abode TO abode;
 \q
 ```
@@ -91,7 +91,7 @@ net start postgresql-x64-16
 ### Step 4: Verify Connection Works
 
 ```powershell
-psql "postgresql://abode:REDACTED-POSTGRES-PASSWORD@localhost:5432/abode" -c "SELECT version();"
+psql "postgresql://abode:<ROTATE-ME-db-password>@localhost:5432/abode" -c "SELECT version();"
 ```
 
 **Expected:** PostgreSQL version string returned successfully
@@ -128,7 +128,7 @@ Edit `.env`:
 
 ```env
 # Change from SQLite to PostgreSQL
-DATABASE_URL=postgresql://abode:REDACTED-POSTGRES-PASSWORD@localhost:5432/abode
+DATABASE_URL=postgresql://abode:<ROTATE-ME-db-password>@localhost:5432/abode
 
 # Strong JWT secret (minimum 32 characters)
 JWT_SECRET=your-very-long-super-secret-random-string-minimum-32-chars-here

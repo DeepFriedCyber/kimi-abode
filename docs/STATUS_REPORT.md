@@ -116,7 +116,7 @@ DEVELOPMENT_MODE=false
 
 **Problem:** Authentication fails with credentials:
 ```
-postgres://abode:REDACTED-POSTGRES-PASSWORD@localhost:5432/abode
+postgres://abode:<ROTATE-ME-db-password>@localhost:5432/abode
 ```
 
 **Root Causes Identified:**
