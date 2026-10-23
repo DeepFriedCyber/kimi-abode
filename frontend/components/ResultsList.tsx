@@ -1,23 +1,14 @@
 /**
- * ResultsList — renders a grid of property cards.
+ * ResultsList — responsive grid of property cards.
  */
 
 "use client";
 
 import PropertyCard from "./PropertyCard";
+import type { Property } from "../lib/types";
 
 interface ResultsListProps {
-  properties: Array<{
-    id?: number;
-    address_line1: string;
-    town?: string;
-    postcode?: string;
-    property_type?: string;
-    num_beds?: number;
-    price_paid?: number;
-    latitude?: number;
-    longitude?: number;
-  }>;
+  properties: Property[];
 }
 
 export default function ResultsList({ properties }: ResultsListProps) {
@@ -31,8 +22,8 @@ export default function ResultsList({ properties }: ResultsListProps) {
 
   return (
     <div className="property-grid">
-      {properties.map((prop) => (
-        <PropertyCard key={prop.id || prop.address_line1} property={prop} />
+      {properties.map((property) => (
+        <PropertyCard key={property.id} property={property} />
       ))}
     </div>
   );

@@ -1,115 +1,108 @@
 /**
- * PropertyCard — individual property listing card component.
- * Includes type safety guards and error handling for numeric fields.
+ * PropertyCard — a single listing card.
  */
 
 "use client";
 
 import Link from "next/link";
+import {
+  effectivePrice,
+  formatArea,
+  formatPerSqm,
+  formatPrice,
+  formatType,
+  priceKind,
+} from "../lib/format";
+import { mediaUrl } from "../lib/api";
+import type { Property } from "../lib/types";
 
 interface PropertyCardProps {
-  property: {
-    id?: number | string;
-    address_line1: string;
-    address_line2?: string;
-    town?: string;
-    postcode?: string;
-    property_type?: string;
-    num_beds?: number;
-    price_paid?: number;
-    latitude?: number;
-    longitude?: number;
-  };
+  property: Property;
 }
 
-/** Type-safe numeric sanitizer to prevent NaN/Infinity display issues. */
-export function sanitizeNumber(value: number | null | undefined): string | "—" {
-  if (value == null) return "—";
-  const num = Number(value);
-  if (!Number.isFinite(num)) return "—";
-  return String(num);
-}
-
-/** Safe price formatter with error handling. */
-function formatPrice(price: number | null | undefined): string {
-  if (price == null) return "Price on request";
-  const num = Number(price);
-  if (!Number.isFinite(num)) return "Price unavailable";
-  return `£${num.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
-}
-
-const typeIcons: Record<string, string> = {
+const TYPE_ICONS: Record<string, string> = {
   detached: "🏡",
   "semi-detached": "🏠",
   terraced: "🏘️",
   bungalow: "🏚️",
   flat: "🏢",
-  unknown: "🏠",
+  maisonette: "🏢",
+  other: "🏠",
 };
 
-/** Safe type label formatter. */
-function formatType(type?: string): string {
-  if (!type) return "";
-  const formatted = type.replace("-", " ");
-  // Capitalize first letter of each word
-  return formatted
-    .split(" ")
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
-}
-
 export default function PropertyCard({ property }: PropertyCardProps) {
-  const price = formatPrice(property.price_paid);
-  const beds = sanitizeNumber(property.num_beds);
-  const typeLabel = formatType(property.property_type);
-  
-  // Safe location construction with fallback
-  const locationParts: string[] = [];
-  if (property.town) locationParts.push(property.town);
-  if (property.postcode) locationParts.push(property.postcode);
-  const location = locationParts.length > 0 ? locationParts.join(", ") : "Location not available";
-
-  // Safe icon lookup with fallback
-  const icon = typeIcons[property.property_type || "unknown"] || "🏠";
+  const location =
+    [property.town, property.postcode].filter(Boolean).join(", ") ||
+    "Location unavailable";
+  const icon = TYPE_ICONS[property.property_type ?? "unknown"] ?? "🏠";
+  const beds = property.num_beds;
+  const kind = priceKind(property);
+  const sizeFacts = [
+    formatArea(property.floor_area_sqm),
+    formatPerSqm(property.price_per_sqm),
+  ].filter(Boolean);
+  const cover = property.photos?.find((photo) => photo.is_cover) ?? property.photos?.[0];
+  const coverUrl = cover ? mediaUrl(cover.thumb_url) : null;
 
   return (
     <Link
-      href={`/property/${property.id || "detail"}`}
+      href={`/property/${property.id}`}
       className="block bg-white rounded-xl border hover:shadow-md transition-shadow overflow-hidden group focus:outline-none focus:ring-2 focus:ring-blue-500"
     >
-      {/* Image placeholder with safe icon */}
-      <div className="h-48 bg-gradient-to-br from-gray-200 to-gray-300 flex items-center justify-center">
-        <span className="text-5xl opacity-50">{icon}</span>
+      <div className="h-40 bg-gradient-to-br from-gray-200 to-gray-300 flex items-center justify-center overflow-hidden">
+        {coverUrl ? (
+          <img
+            src={coverUrl}
+            alt=""
+            className="w-full h-full object-cover"
+            loading="lazy"
+            width={cover?.width}
+            height={cover?.height}
+          />
+        ) : (
+          <span className="text-5xl opacity-50" aria-hidden>
+            {icon}
+          </span>
+        )}
       </div>
 
       <div className="p-4 space-y-2">
-        <div className="flex items-start justify-between gap-2">
-          <h3 className="font-semibold text-gray-900 group-hover:text-blue-600 transition-colors truncate" title={property.address_line1}>
-            {property.address_line1}
-          </h3>
-        </div>
+        <h3
+          className="font-semibold text-gray-900 group-hover:text-blue-600 transition-colors truncate"
+          title={property.address_line1}
+        >
+          {property.address_line1}
+        </h3>
 
-        {/* Address line 2 if available */}
         {property.address_line2 && (
           <p className="text-sm text-gray-600 truncate" title={property.address_line2}>
             {property.address_line2}
           </p>
         )}
 
-        <p className="text-lg font-bold text-green-700">{price}</p>
-
-        <div className="flex flex-wrap gap-2 text-sm text-gray-600">
-          {beds && beds !== "—" && (
-            <span>{beds === 1 ? `${beds} bed` : `${beds} beds`}</span>
-          )}
-          {typeLabel && <span className="capitalize">{typeLabel}</span>}
+        <div className="flex items-baseline justify-between gap-2">
+          <p className="text-lg font-bold text-green-700">
+            {formatPrice(effectivePrice(property))}
+          </p>
+          <span className="text-[10px] uppercase tracking-wide text-gray-400">{kind}</span>
         </div>
 
-        {location !== "Location not available" && (
-          <p className="text-sm text-gray-500 truncate">
-            {location}
-          </p>
+        <div className="flex flex-wrap gap-2 text-sm text-gray-600">
+          {beds !== null && beds !== undefined && (
+            <span>
+              {beds} {beds === 1 ? "bed" : "beds"}
+            </span>
+          )}
+          {property.property_type && (
+            <span className="capitalize">{formatType(property.property_type)}</span>
+          )}
+        </div>
+
+        {sizeFacts.length > 0 && (
+          <p className="text-xs text-gray-500">{sizeFacts.join(" · ")}</p>
         )}
+
+        <p className="text-sm text-gray-500 truncate">{location}</p>
       </div>
     </Link>
   );

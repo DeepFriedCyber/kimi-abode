@@ -1,156 +1,90 @@
 /**
- * Property detail page — displays full property info with POI intelligence.
- * Includes error boundaries and type safety guards.
+ * Property detail page — full property information plus POI intelligence.
  */
 
 "use client";
 
-import { useParams } from "next/navigation";
-import { useState, useEffect, useCallback, useMemo } from "react";
 import Link from "next/link";
+import { useParams } from "next/navigation";
+import { useEffect, useState } from "react";
 import AskLocation from "../../../components/AskLocation";
-import { fetchProperty, healthCheck as checkHealth } from "../../../lib/api";
-import type { Property, POI } from "../../../lib/types";
+import AskAboutArea from "../../../components/AskAboutArea";
+import PhotoGallery from "../../../components/PhotoGallery";
+import { ApiError, fetchProperty } from "../../../lib/api";
+import {
+  effectivePrice,
+  formatArea,
+  formatDate,
+  formatNumber,
+  formatPerSqm,
+  formatPrice,
+  formatStatus,
+  formatType,
+  priceKind,
+} from "../../../lib/format";
+import type { Property } from "../../../lib/types";
 
-/** Sanitizes numeric values to prevent NaN/Infinity display issues. */
-export function sanitizeNumber(value: number | null | undefined): string | "—" {
-  if (value == null) return "—";
-  const num = Number(value);
-  if (!Number.isFinite(num)) return "—";
-  return String(num);
-}
+const TYPE_LABELS: Record<string, string> = {
+  detached: "Detached house",
+  "semi-detached": "Semi-detached house",
+  terraced: "Terraced house",
+  bungalow: "Bungalow",
+  flat: "Flat",
+  maisonette: "Maisonette",
+  other: "Property",
+};
 
-/** Safe price formatter with fallback. */
-function formatPrice(price: number | null | undefined): string {
-  if (price == null) return "Price on request";
-  const num = Number(price);
-  if (!Number.isFinite(num)) return "Price unavailable";
-  return `£${num.toLocaleString()}`;
-}
-
-/** Safe POI distance formatter. */
-function formatDistance(meters: number | null | undefined): string {
-  if (meters == null) return "—";
-  const dist = Number(meters);
-  if (!Number.isFinite(dist)) return "—";
-  // Convert to reasonable units (km for >1000m, m for <1000m)
-  return dist >= 1000 ? `${(dist / 1000).toFixed(1)} km` : `${dist} m`;
-}
-
-/** Safe boolean formatter. */
-function formatBoolean(value: boolean | null | undefined): string {
-  if (value == null) return "—";
-  return value ? "Yes" : "No";
-}
 
 export default function PropertyDetailPage() {
   const params = useParams();
-  const propertyId = params.id as string | undefined;
+  const propertyId = typeof params?.id === "string" ? params.id : undefined;
 
   const [property, setProperty] = useState<Property | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  /** Health check cache with stale-while-revalidate pattern. */
-  const [healthOk, setHealthOk] = useState(true);
-  const healthCheckTimeout = useMemo(() => {
-    // Cache for 30 seconds (stale-while-revalidate)
-    return 30_000;
-  }, []);
-
-  /** Perform health check if needed (not recently checked). */
-  function checkHealthIfNeeded(): void {
-    const now = Date.now();
-    // We'll use a simple state-based approach since we don't have lastCheck timestamp
-    // In production, you'd track the timestamp and only check if older than timeout
-  }
-
-  /** Fetch property with proper error handling. */
-  async function fetchPropertySafe(id: string): Promise<Property | null> {
-    try {
-      const data = await fetchProperty(id);
-      // Validate required fields to avoid rendering broken UI
-      if (!data || !data.id || !data.address_line1) {
-        return null;
-      }
-      return data;
-    } catch (err) {
-      console.error("Property fetch failed:", err);
-      setError(err instanceof Error ? err.message : "Failed to load property");
-      return null;
-    }
-  }
-
   useEffect(() => {
     if (!propertyId) {
-      setError("Property ID not found");
+      setError("Property id is missing");
       setLoading(false);
       return;
     }
 
-    const cleanup = () => {
-      // Clear previous data on unmount
-      setProperty(null);
-    };
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
 
-    const loadProperty = async () => {
-      try {
-        setLoading(true);
-        setError(null);
-        
-        const data = await fetchPropertySafe(propertyId);
-        if (data) {
-          setProperty(data);
-          
-          // Update health status on successful fetch
-          setHealthOk(true);
-        } else {
+    fetchProperty(propertyId)
+      .then((data) => {
+        if (cancelled) return;
+        if (!data) {
           setError("Property not found");
+          setProperty(null);
+          return;
         }
-      } catch (err) {
-        console.error("Property fetch failed:", err);
-        setError(err instanceof Error ? err.message : "Failed to load property");
-      } finally {
-        setLoading(false);
-      }
+        setProperty(data);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setProperty(null);
+        setError(
+          err instanceof ApiError ? err.message : "Failed to load this property",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
     };
-
-    loadProperty();
-    
-    // Cleanup on unmount
-    return cleanup;
   }, [propertyId]);
-
-  /** Type labels with fallback. */
-  const typeLabels = useMemo(() => ({
-    detached: "Detached House",
-    "semi-detached": "Semi-Detached House",
-    terraced: "Terraced House",
-    bungalow: "Bungalow",
-    flat: "Flat",
-    unknown: "Property",
-  }), []);
-
-  /** Type icons with fallback. */
-  const typeIcons = useMemo(() => ({
-    detached: "🏡",
-    "semi-detached": "🏠",
-    terraced: "🏘️",
-    bungalow: "🏚️",
-    flat: "🏢",
-    unknown: "🏠",
-  }), []);
-
-  const typeLabel = typeLabels[property?.property_type || "unknown"];
-  const icon = typeIcons[property?.property_type || "unknown"] || "🏠";
 
   if (loading) {
     return (
       <div className="max-w-4xl mx-auto space-y-6">
-        <Link href="/" className="text-sm text-blue-600 hover:underline">
-          ← Back to search
-        </Link>
-        <div className="text-center py-12 text-gray-500">Loading property...</div>
+        <BackLink />
+        <p className="text-center py-12 text-gray-500">Loading property…</p>
       </div>
     );
   }
@@ -158,95 +92,147 @@ export default function PropertyDetailPage() {
   if (error || !property) {
     return (
       <div className="max-w-4xl mx-auto space-y-6">
-        <Link href="/" className="text-sm text-blue-600 hover:underline">
-          ← Back to search
-        </Link>
-        <div className="text-center py-12 text-red-500">
-          <p>{error || "Property not found"}</p>
-          <button
-            onClick={() => window.location.reload()}
-            className="mt-2 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
-          >
-            Try again
-          </button>
+        <BackLink />
+        <div className="text-center py-12 text-red-600">
+          <p>{error ?? "Property not found"}</p>
         </div>
       </div>
     );
   }
 
+  const typeKey = property.property_type ?? "other";
+  const typeLabel = TYPE_LABELS[typeKey] ?? formatType(typeKey);
+  const hasCoordinates =
+    typeof property.latitude === "number" && typeof property.longitude === "number";
+
+  const facts = [
+    { label: "Bedrooms", value: formatNumber(property.num_beds) },
+    { label: "Type", value: typeLabel.replace(" house", "") },
+    { label: "Floor area", value: formatArea(property.floor_area_sqm) ?? "—" },
+    { label: "Plot size", value: formatArea(property.plot_size_sqm) ?? "—" },
+    { label: "Price / m²", value: formatPerSqm(property.price_per_sqm) ?? "—" },
+    { label: "Tenure", value: property.tenure ?? "—" },
+    { label: "Outcode", value: property.outcode ?? "—" },
+    {
+      label: property.asking_price ? "Listed" : "Last sold",
+      value: formatDate(property.asking_price ? property.listed_at : property.date_sold),
+    },
+  ];
+
   return (
     <div className="max-w-4xl mx-auto space-y-6">
-      {/* Back button */}
-      <Link href="/" className="text-sm text-blue-600 hover:underline">
-        ← Back to search
-      </Link>
+      <BackLink />
 
-      {/* Header */}
-      <div className="bg-white rounded-xl border overflow-hidden shadow-sm">
-        <div className="h-64 bg-gradient-to-br from-gray-100 to-gray-200 flex items-center justify-center">
-          <span className="text-7xl opacity-40">{icon}</span>
-        </div>
+      <article className="bg-white rounded-xl border overflow-hidden shadow-sm">
+        <PhotoGallery
+          photos={property.photos ?? []}
+          address={property.address_line1}
+        />
 
         <div className="p-6">
-          <div className="flex justify-between items-start mb-2">
+          <div className="flex flex-col sm:flex-row sm:justify-between sm:items-start gap-3">
             <div>
               <h1 className="text-2xl font-bold">{property.address_line1}</h1>
               {property.address_line2 && (
                 <p className="text-gray-600">{property.address_line2}</p>
               )}
               <p className="text-gray-500 mt-1">
-                {[property.town, property.postcode].filter(Boolean).join(", ") || "N/A"}
+                {[property.town, property.postcode].filter(Boolean).join(", ") ||
+                  "Location unavailable"}
               </p>
+              {property.ward && property.ward !== property.town && (
+                <p className="text-xs text-gray-400 mt-1">
+                  {property.ward}
+                  {property.district ? ` · ${property.district}` : ""}
+                </p>
+              )}
             </div>
-            <div className="text-right">
-              <p className="text-3xl font-bold text-green-700">{formatPrice(property.price_paid)}</p>
-              <p className="text-sm text-gray-500 mt-1">{typeLabel}</p>
+            <div className="sm:text-right">
+              <p className="text-3xl font-bold text-green-700">
+                {formatPrice(effectivePrice(property))}
+              </p>
+              <p className="text-sm text-gray-500 mt-1">
+                {priceKind(property)} price · {typeLabel}
+              </p>
+              {property.listing_status && (
+                <span className="inline-block mt-2 px-2 py-1 rounded-full text-xs bg-blue-50 text-blue-800 capitalize">
+                  {formatStatus(property.listing_status)}
+                </span>
+              )}
             </div>
           </div>
 
-          {/* Key facts with safe type coercion */}
-          <div className="grid grid-cols-3 gap-4 mt-6 py-4 border-t">
-            <div className="text-center">
-              <p className="text-2xl font-bold">{sanitizeNumber(property.num_beds)}</p>
-              <p className="text-xs text-gray-500">Bedrooms</p>
-            </div>
-            <div className="text-center border-x">
-              <p className="text-2xl font-bold capitalize">{(property.property_type || "").replace("-", " ")}</p>
-              <p className="text-xs text-gray-500">Type</p>
-            </div>
-            <div className="text-center">
-              <p className="text-2xl font-bold">{sanitizeNumber(property.postcode)}</p>
-              <p className="text-xs text-gray-500">Postcode</p>
-            </div>
+          <dl className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-6 py-4 border-t text-center">
+            {facts.map((fact) => (
+              <div key={fact.label}>
+                <dt className="text-xs text-gray-500">{fact.label}</dt>
+                <dd className="text-lg font-semibold">{fact.value}</dd>
+              </div>
+            ))}
+          </dl>
+
+          {(property.description || property.features?.length) && (
+            <section className="mt-4 pt-4 border-t">
+              <h2 className="text-sm font-semibold text-gray-700 mb-2">Description</h2>
+              {property.description && (
+                <p className="text-sm text-gray-600 whitespace-pre-line">{property.description}</p>
+              )}
+              {property.features && property.features.length > 0 && (
+                <ul className="mt-3 grid sm:grid-cols-2 gap-1 text-sm text-gray-600 list-disc list-inside">
+                  {property.features.map((feature) => (
+                    <li key={feature}>{feature}</li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          )}
+
+          {(property.agent_id || property.agent_ref) && (
+            <p className="text-xs text-gray-400 mt-3">
+              Listed by {property.agent_id ?? "agent"}
+              {property.agent_ref ? ` · ref ${property.agent_ref}` : ""}
+            </p>
+          )}
+
+          <div className="pt-2 border-t flex flex-wrap items-center justify-between gap-2 text-xs text-gray-400">
+            <span>
+              Source: {property.source ?? "unknown"}
+              {property.geo_precision ? ` · location: ${property.geo_precision}` : ""}
+            </span>
+            {property.source_url && (
+              <a
+                href={property.source_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:underline"
+              >
+                View original record ↗
+              </a>
+            )}
           </div>
-
-          {/* Additional safe fields */}
-          {property.year_build && (
-            <div className="mt-4 py-2 border-t text-center">
-              <p className="text-sm text-gray-700">
-                Built: {sanitizeNumber(property.year_build)}
-              </p>
-            </div>
-          )}
-
-          {property.council_tax_band && (
-            <div className="mt-4 py-2 border-t text-center">
-              <p className="text-sm text-gray-700">
-                Council Tax: {formatBoolean(property.council_tax_band)}
-              </p>
-            </div>
-          )}
         </div>
-      </div>
+      </article>
 
-      {/* POI Intelligence */}
-      {property.latitude && property.longitude && (
+      <AskAboutArea propertyId={property.id} />
+
+      {hasCoordinates ? (
         <AskLocation
-          propertyId={property.id}
-          lat={Number(property.latitude)}
-          lon={Number(property.longitude)}
+          lat={property.latitude as number}
+          lon={property.longitude as number}
         />
+      ) : (
+        <div className="bg-white rounded-xl border p-4 text-sm text-gray-500">
+          📍 Amenity data is unavailable because this property has no coordinates.
+        </div>
       )}
     </div>
+  );
+}
+
+function BackLink() {
+  return (
+    <Link href="/" className="text-sm text-blue-600 hover:underline">
+      ← Back to search
+    </Link>
   );
 }

@@ -1,109 +1,120 @@
 /**
- * AskLocation — POI intelligence panel for property detail pages.
- * Queries nearby amenities (schools, transport, shops) with proximity scoring.
+ * AskLocation — nearby amenities for a property.
  */
 
 "use client";
 
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { getNearbyPois } from "../lib/api";
+import { formatDistance } from "../lib/format";
 import type { PoiResult } from "../lib/types";
 
 interface AskLocationProps {
-  propertyId?: string | number;
   lat: number;
   lon: number;
 }
 
-export default function AskLocation({ propertyId, lat, lon }: AskLocationProps) {
-  const [loading, setLoading] = useState(false);
+const CATEGORY_ICONS: Record<string, string> = {
+  school: "🎓",
+  supermarket: "🛒",
+  convenience: "🏪",
+  station: "🚂",
+  pub: "🍺",
+  restaurant: "🍽️",
+  cafe: "☕",
+  fitness: "🏋️",
+  pharmacy: "💊",
+  doctors: "🩺",
+  dentist: "🦷",
+  hospital: "🏥",
+  park: "🌳",
+  playground: "🛝",
+  nursery: "🧸",
+  bar: "🍸",
+};
+
+export default function AskLocation({ lat, lon }: AskLocationProps) {
+  const [loading, setLoading] = useState(true);
   const [nearby, setNearby] = useState<PoiResult[]>([]);
   const [scores, setScores] = useState<Record<string, number>>({});
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      if (lat == null || lon == null) {
-        if (!cancelled) setError("Property coordinates not available");
-        if (!cancelled) setLoading(false);
-        return;
-      }
-
-      setLoading(true);
-      setError(null);
-      try {
-        const data = await getNearbyPois(lat, lon, undefined, 8);
-        if (cancelled) return;
-        setNearby(data.nearby || []);
-        setScores(data.category_scores || {});
-      } catch (err) {
-        if (!cancelled) {
-          setError("Unable to load nearby amenities. Please try again later.");
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      setError("Coordinates are unavailable for this property");
+      setLoading(false);
+      return;
     }
 
-    load();
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    getNearbyPois(lat, lon, undefined, 8)
+      .then((data) => {
+        if (cancelled) return;
+        setNearby(data.nearby ?? []);
+        setScores(data.category_scores ?? {});
+      })
+      .catch(() => {
+        if (!cancelled) setError("Unable to load nearby amenities");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [lat, lon, propertyId]);
-
-  const categoryIcons: Record<string, string> = {
-    school: "🎓",
-    supermarket: "🛒",
-    station: "🚂",
-    pub: "🍺",
-    restaurant: "🍽️",
-    hospital: "🏥",
-  };
+  }, [lat, lon]);
 
   return (
-    <div className="bg-white rounded-xl border p-4 mt-6">
-      <h3 className="font-semibold mb-3 flex items-center gap-2">
-        <span>📍</span> Nearby Amenities
-      </h3>
+    <section className="bg-white rounded-xl border p-4">
+      <h2 className="font-semibold mb-3 flex items-center gap-2">
+        <span aria-hidden>📍</span> Nearby amenities
+      </h2>
 
       {loading ? (
-        <p className="text-sm text-gray-400 animate-pulse">Loading...</p>
+        <p className="text-sm text-gray-400 animate-pulse">Loading…</p>
       ) : error ? (
-        <p className="text-sm text-red-500">{error}</p>
+        <p className="text-sm text-gray-500">{error}</p>
       ) : nearby.length === 0 ? (
-        <p className="text-sm text-gray-500">No nearby amenities found.</p>
+        <p className="text-sm text-gray-500">No amenity data available for this area.</p>
       ) : (
         <>
-          {/* Category scores bar */}
-          <div className="flex gap-2 mb-4 flex-wrap">
-            {Object.entries(scores).map(([cat, score]) => (
-              <span key={cat} className="text-xs bg-gray-100 px-2 py-1 rounded-full capitalize">
-                {categoryIcons[cat] || "📍"} {score.toFixed(0)} pts
-              </span>
-            ))}
-          </div>
+          {Object.keys(scores).length > 0 && (
+            <div className="flex gap-2 mb-4 flex-wrap">
+              {Object.entries(scores).map(([category, score]) => (
+                <span
+                  key={category}
+                  className="text-xs bg-gray-100 px-2 py-1 rounded-full capitalize"
+                >
+                  {CATEGORY_ICONS[category] ?? "📍"} {score.toFixed(0)} pts
+                </span>
+              ))}
+            </div>
+          )}
 
-          {/* List */}
-          <div className="space-y-2">
-            {nearby.map((poi, i) => (
-              <div key={i} className="flex items-center justify-between py-1.5 text-sm border-b border-gray-100 last:border-0">
+          <ul className="space-y-2">
+            {nearby.map((poi) => (
+              <li
+                key={`${poi.category}-${poi.name}-${poi.distance_m}`}
+                className="flex items-center justify-between py-1.5 text-sm border-b border-gray-100 last:border-0"
+              >
                 <span className="flex items-center gap-2">
-                  <span>{categoryIcons[poi.category] || "📍"}</span>
+                  <span aria-hidden>{CATEGORY_ICONS[poi.category] ?? "📍"}</span>
                   <span className="text-gray-900">{poi.name}</span>
                 </span>
                 <span className="text-gray-500 text-xs">
-                  {poi.distance_m > 1000
-                    ? `${(poi.distance_m / 1000).toFixed(1)} km · ${poi.walk_time_min}m walk`
-                    : `${poi.distance_m}m · ${poi.walk_time_min}m walk`}
+                  {formatDistance(poi.distance_m)}
+                  {" · "}
+                  {poi.walk_time_min} min walk
                 </span>
-              </div>
+              </li>
             ))}
-          </div>
+          </ul>
         </>
       )}
-    </div>
+    </section>
   );
 }

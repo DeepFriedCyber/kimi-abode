@@ -1,5 +1,8 @@
 /**
- * FilterChips — display and modify search filters as interactive chips.
+ * FilterChips — beds / price / property-type filters.
+ *
+ * Each price option maps to an explicit value; parsing the label ("£100k-£200k"
+ * used to become £100,200,000) was a bug.
  */
 
 "use client";
@@ -18,7 +21,16 @@ interface FilterChipsProps {
 }
 
 const BED_OPTIONS = [1, 2, 3, 4, 5];
-const PRICE_OPTIONS = ["Under £100k", "£100k-£200k", "£200k-£300k", "£300k+", "No limit"];
+
+const PRICE_OPTIONS: Array<{ label: string; value?: number }> = [
+  { label: "Under £100k", value: 100_000 },
+  { label: "Under £200k", value: 200_000 },
+  { label: "Under £300k", value: 300_000 },
+  { label: "Under £400k", value: 400_000 },
+  { label: "Under £500k", value: 500_000 },
+  { label: "No limit", value: undefined },
+];
+
 const TYPE_OPTIONS = [
   { value: "", label: "All types" },
   { value: "detached", label: "Detached" },
@@ -31,98 +43,124 @@ const TYPE_OPTIONS = [
 export default function FilterChips({ filters, onChange }: FilterChipsProps) {
   const [openFilter, setOpenFilter] = useState<string | null>(null);
 
-  const updateFilter = (key: keyof Filters, value: any) => {
-    onChange({ ...filters, [key]: value });
+  const toggle = (name: string) =>
+    setOpenFilter((current) => (current === name ? null : name));
+
+  const update = (patch: Partial<Filters>) => {
+    onChange({ ...filters, ...patch });
     setOpenFilter(null);
   };
 
   return (
-    <div className="flex flex-wrap gap-2 items-center justify-center">
-      {/* Beds filter */}
+    <div className="flex flex-wrap gap-2 items-center">
+      {/* Beds */}
       <div className="relative">
         <button
-          onClick={() => setOpenFilter(openFilter === "beds" ? null : "beds")}
+          type="button"
+          aria-expanded={openFilter === "beds"}
+          onClick={() => toggle("beds")}
           className={`px-4 py-2 rounded-full border text-sm font-medium transition-colors ${
             filters.minBeds
               ? "bg-blue-100 border-blue-300 text-blue-700"
               : "bg-white border-gray-300 text-gray-700 hover:border-gray-400"
           }`}
         >
-          {filters.minBeds ? `${filters.minBeds}+ bed` : "Beds"}
+          {filters.minBeds ? `${filters.minBeds}+ beds` : "Beds"}
         </button>
         {openFilter === "beds" && (
-          <div className="absolute top-full left-0 mt-1 bg-white border rounded-lg shadow-lg p-2 z-10 min-w-[120px]">
-            {BED_OPTIONS.map((n) => (
+          <div className="absolute top-full left-0 mt-1 bg-white border rounded-lg shadow-lg p-2 z-20 min-w-[130px]">
+            {BED_OPTIONS.map((count) => (
               <button
-                key={n}
-                onClick={() => updateFilter("minBeds", n)}
+                key={count}
+                type="button"
+                onClick={() => update({ minBeds: count })}
                 className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 rounded"
               >
-                {n}+ beds
+                {count}+ beds
               </button>
             ))}
+            <button
+              type="button"
+              onClick={() => update({ minBeds: undefined })}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-500 hover:bg-gray-100 rounded"
+            >
+              Any
+            </button>
           </div>
         )}
       </div>
 
-      {/* Price filter */}
+      {/* Price */}
       <div className="relative">
         <button
-          onClick={() => setOpenFilter(openFilter === "price" ? null : "price")}
+          type="button"
+          aria-expanded={openFilter === "price"}
+          onClick={() => toggle("price")}
           className={`px-4 py-2 rounded-full border text-sm font-medium transition-colors ${
             filters.maxPrice
               ? "bg-blue-100 border-blue-300 text-blue-700"
               : "bg-white border-gray-300 text-gray-700 hover:border-gray-400"
           }`}
         >
-          Price
+          {filters.maxPrice
+            ? `Under £${Math.round(filters.maxPrice / 1000)}k`
+            : "Price"}
         </button>
         {openFilter === "price" && (
-          <div className="absolute top-full left-0 mt-1 bg-white border rounded-lg shadow-lg p-2 z-10 min-w-[160px]">
-            {PRICE_OPTIONS.map((opt) => (
+          <div className="absolute top-full left-0 mt-1 bg-white border rounded-lg shadow-lg p-2 z-20 min-w-[170px]">
+            {PRICE_OPTIONS.map((option) => (
               <button
-                key={opt}
-                onClick={() => updateFilter("maxPrice", opt === "No limit" ? undefined : parseFloat(opt.replace(/[^0-9]/g, "")) * 1000)}
+                key={option.label}
+                type="button"
+                onClick={() => update({ maxPrice: option.value })}
                 className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 rounded"
               >
-                {opt}
+                {option.label}
               </button>
             ))}
           </div>
         )}
       </div>
 
-      {/* Type filter */}
+      {/* Type */}
       <div className="relative">
         <button
-          onClick={() => setOpenFilter(openFilter === "type" ? null : "type")}
+          type="button"
+          aria-expanded={openFilter === "type"}
+          onClick={() => toggle("type")}
           className={`px-4 py-2 rounded-full border text-sm font-medium transition-colors ${
             filters.propertyType
               ? "bg-blue-100 border-blue-300 text-blue-700"
               : "bg-white border-gray-300 text-gray-700 hover:border-gray-400"
           }`}
         >
-          {TYPE_OPTIONS.find((t) => t.value === filters.propertyType)?.label || "Type"}
+          {TYPE_OPTIONS.find((option) => option.value === filters.propertyType)?.label ??
+            "Type"}
         </button>
         {openFilter === "type" && (
-          <div className="absolute top-full left-0 mt-1 bg-white border rounded-lg shadow-lg p-2 z-10 min-w-[160px]">
-            {TYPE_OPTIONS.map((opt) => (
+          <div className="absolute top-full left-0 mt-1 bg-white border rounded-lg shadow-lg p-2 z-20 min-w-[170px]">
+            {TYPE_OPTIONS.map((option) => (
               <button
-                key={opt.value}
-                onClick={() => updateFilter("propertyType", opt.value)}
+                key={option.value || "all"}
+                type="button"
+                onClick={() => update({ propertyType: option.value })}
                 className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 rounded"
               >
-                {opt.label}
+                {option.label}
               </button>
             ))}
           </div>
         )}
       </div>
 
-      {/* Clear all */}
-      {(filters.minBeds || filters.maxPrice || filters.propertyType) && (
+      {(filters.minBeds !== undefined ||
+        filters.maxPrice !== undefined ||
+        filters.propertyType) && (
         <button
-          onClick={() => onChange({ minBeds: undefined, maxPrice: undefined, propertyType: "" })}
+          type="button"
+          onClick={() =>
+            onChange({ minBeds: undefined, maxPrice: undefined, propertyType: "" })
+          }
           className="px-4 py-2 rounded-full border text-sm font-medium text-red-600 hover:bg-red-50 border-red-300 transition-colors"
         >
           Clear all
