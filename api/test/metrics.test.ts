@@ -1,47 +1,48 @@
 /**
- * Tests for metrics / observability.
+ * Metrics unit tests.
  */
 
-import { describe, it, expect } from "vitest";
-import { Metrics, metricsHook } from "../src/observability/metrics";
+import { describe, expect, it } from "vitest";
+import { Metrics, metricKey, metricsHook } from "../src/observability/metrics";
 
 describe("Metrics", () => {
-  const metrics = new Metrics();
-
   it("increments request count", () => {
+    const metrics = new Metrics();
     metrics.inc("test");
-    expect(metrics["requestCount"].get("test")).toBe(1);
+    expect(metrics.render()).toContain("abode_http_test_total 1");
   });
 
   it("renders Prometheus-compatible output", () => {
+    const metrics = new Metrics();
     metrics.inc("requests", 5);
-    const rendered = metrics.render();
-    expect(rendered).toContain("abode_http_requests_total 5");
+    expect(metrics.render()).toContain("abode_http_requests_total 5");
   });
 
-  it("records latency observations", () => {
+  it("averages latency observations", () => {
+    const metrics = new Metrics();
     metrics.observe("search_ms", 100);
     metrics.observe("search_ms", 200);
-    const avg = (metrics["latencySum"].get("search_ms") || 0) / (metrics["latencyCount"].get("search_ms") || 1);
-    expect(avg).toBe(150);
+    expect(metrics.render()).toContain("abode_http_search_ms_avg_latency_ms 150.00");
   });
 
   it("returns empty string when no metrics", () => {
-    const m = new Metrics();
-    expect(m.render()).toBe("");
+    expect(new Metrics().render()).toBe("");
   });
 });
 
 describe("metricsHook", () => {
-  it("calls inc with the correct path", async () => {
+  it("counts every response and normalises the path", async () => {
     const metrics = new Metrics();
     const hook = metricsHook(metrics);
 
-    const mockReq = { route: null, url: "/test" }; // route is null in our test
-    const mockReply = { statusCode: 200 };
+    const request = { url: "/test", routeOptions: undefined } as never;
+    await hook(request, { statusCode: 500 } as never);
 
-    await hook(mockReq, mockReply);
-    // Route path "/test" → key "test_responses"
-    expect(metrics["requestCount"].get("test_responses")).toBe(1);
+    expect(metrics.render()).toContain("abode_http_test_responses_total 1");
+  });
+
+  it("uses the route template so ids do not explode cardinality", () => {
+    const key = metricKey({ url: "/api/property/123", routeOptions: { url: "/api/property/:id" } } as never);
+    expect(key).toBe("api_property_id_responses");
   });
 });

@@ -1,49 +1,117 @@
 /**
- * Socket.IO WebSocket Handler for real-time chat functionality.
+ * Socket.IO bridge for chat.
+ *
+ * Attaches to Fastify's underlying HTTP server and forwards chat messages to
+ * the AI service's SSE endpoint, re-emitting decoded chunks to the client.
  */
 
-import { Server } from 'socket.io';
-import type http from 'http';
+import type { Server as HttpServer } from "node:http";
+import { Server as SocketIOServer, type Socket } from "socket.io";
 
-// Create HTTP server (needed for Socket.IO to bind)
-let httpServer: http.Server | null = null;
+export interface ChatSocketOptions {
+  aiUrl: string;
+  corsOrigin: string | string[];
+}
 
-export function attachChatSocket(ioServer: Server, opts?: { corsOrigin?: string; }) {
-  console.log("[SocketIO] Initializing WebSocket handler");
-  
-  // Configure CORS directly via ioServer.attach or use HTTP server options
-  const corsOrigin = opts?.corsOrigin || process.env.FRONTEND_URL || '*';
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
 
-  // Handle socket connections
-  ioServer.on('connection', (socket) => {
-    console.log(`[SocketIO] User connected: ${socket.id}`);
+const MAX_MESSAGES = 50;
 
-    // Join room
-    socket.on('join-room', (data: { roomId: string }) => {
-      const { roomId } = data;
-      socket.join(roomId);
-      console.log(`[SocketIO] Socket ${socket.id} joined room "${roomId}"`);
+function isChatMessage(value: unknown): value is ChatMessage {
+  if (typeof value !== "object" || value === null) return false;
+  const message = value as Record<string, unknown>;
+  return (
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.content === "string" &&
+    message.content.length > 0 &&
+    message.content.length <= 4_000
+  );
+}
+
+export function attachChatSocket(server: HttpServer, opts: ChatSocketOptions): SocketIOServer {
+  const io = new SocketIOServer(server, {
+    cors: { origin: opts.corsOrigin, methods: ["GET", "POST"] },
+    serveClient: false,
+  });
+
+  io.on("connection", (socket: Socket) => {
+    let controller: AbortController | null = null;
+
+    socket.on("chat:message", async (payload: unknown) => {
+      const data = payload as { messages?: unknown };
+      const messages = Array.isArray(data?.messages) ? data.messages : [];
+
+      if (messages.length === 0 || messages.length > MAX_MESSAGES || !messages.every(isChatMessage)) {
+        socket.emit("chat:error", { message: "Invalid message payload" });
+        return;
+      }
+
+      controller?.abort();
+      controller = new AbortController();
+
+      try {
+        const response = await fetch(`${opts.aiUrl}/chat/chat/stream`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+          body: JSON.stringify({ messages }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          socket.emit("chat:error", { message: "AI service unavailable" });
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const raw = line.slice(6).trim();
+            if (!raw) continue;
+            if (raw === "[DONE]") {
+              socket.emit("chat:done");
+              return;
+            }
+            try {
+              const parsed = JSON.parse(raw) as { chunk?: string };
+              if (typeof parsed.chunk === "string") {
+                socket.emit("chat:response", { chunk: parsed.chunk });
+              }
+            } catch {
+              // Ignore malformed frames rather than tearing down the stream.
+              socket.emit("chat:response", { chunk: raw });
+            }
+          }
+        }
+
+        socket.emit("chat:done");
+      } catch (error) {
+        if ((error as Error).name !== "AbortError") {
+          socket.emit("chat:error", { message: "Chat request failed" });
+        }
+      }
     });
 
-    // Send message
-    socket.on('send-message', (data: { roomId: string; text: string }) => {
-      const { roomId, text } = data;
-      ioServer.to(roomId).emit('receive-message', { text, from: socket.id });
-    });
-
-    // Leave room
-    socket.on('leave-room', (roomId: string) => {
-      socket.leave(roomId);
-      console.log(`[SocketIO] Socket ${socket.id} left room "${roomId}"`);
-    });
-
-    // Disconnect
-    socket.on('disconnect', () => {
-      console.log(`[SocketIO] User disconnected: ${socket.id}`);
+    socket.on("disconnect", () => {
+      controller?.abort();
+      controller = null;
     });
   });
 
-  // HTTP server is attached internally by Socket.IO, no need to expose it
+  return io;
 }
 
 export default attachChatSocket;

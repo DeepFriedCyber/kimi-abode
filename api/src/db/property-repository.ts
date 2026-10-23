@@ -1,49 +1,66 @@
 /**
- * Property Repository — Database abstraction for property search and retrieval.
- * Simplified implementation using only InMemoryPropertyStore.
+ * Property store facade.
+ *
+ * Selects a backend once at process start and exposes a single instance so
+ * health checks and routes observe the same data. Previously each request
+ * created a fresh store, which is why health always reported zero rows.
  */
 
-import type { Property, PropertyStore } from "./types";
-import { InMemoryPropertyStore } from "./types";
+import { InMemoryPropertyStore, type Property, type PropertyStore } from "./types";
+import { SqlitePropertyRepository } from "./sqlite-repository";
 
 export class PropertyRepository implements PropertyStore {
-  private repo: InMemoryPropertyStore;
+  constructor(private readonly store: PropertyStore = new InMemoryPropertyStore()) {}
 
-  constructor() {
-    // Always use InMemoryPropertyStore for simplicity and reliability
-    console.log("[PropertyRepository] Using in-memory store (simplified implementation)");
-    this.repo = new InMemoryPropertyStore();
+  get driver(): string {
+    return this.store.driver;
   }
 
-  async getAll(): Promise<Property[]> {
-    return this.repo.getAll();
+  getAll(): Promise<Property[]> {
+    return this.store.getAll();
   }
 
-  async getLimited(limit: number): Promise<Property[]> {
-    const all = await this.repo.getAll();
-    return all.slice(0, limit);
+  getLimited(limit: number): Promise<Property[]> {
+    return this.store.getLimited(limit);
   }
 
-  async count(): Promise<number> {
-    const all = await this.repo.getAll();
-    return all.length;
+  count(): Promise<number> {
+    return this.store.count();
   }
 
-  async find(query: string): Promise<Property[]> {
-    const results = await this.repo.find(query);
-    return results.slice(0, 50);
+  find(query: string): Promise<Property[]> {
+    return this.store.find(query);
   }
 
-  async upsert(property: Partial<Property>): Promise<number> {
-    // In-memory store always creates new entries with incremented ID
-    return await this.repo.upsert({
-      ...property,
-      id: Date.now() % 1000000, // Simple ID generation for in-memory
-    });
+  upsert(property: Partial<Property>): Promise<number> {
+    return this.store.upsert(property);
   }
 
-  async clear(): Promise<void> {
-    console.log("[PropertyRepository] In-memory fallback - cleared");
-    await this.repo.clear();
+  clear(): Promise<void> {
+    return this.store.clear();
   }
 }
+
+/**
+ * Build the store for this process.
+ *
+ * SQLite is opt-in via SQLITE_PATH so that a stray DATABASE_URL cannot make the
+ * gateway create an empty database file it never uses (search lives in the AI
+ * service's Postgres).
+ */
+export function createPropertyRepository(sqlitePath?: string): PropertyRepository {
+  if (sqlitePath) {
+    try {
+      return new PropertyRepository(new SqlitePropertyRepository(sqlitePath));
+    } catch (error) {
+      console.error("[PropertyRepository] Failed to open SQLite store:", error);
+    }
+  }
+  return new PropertyRepository(new InMemoryPropertyStore());
+}
+
+export const propertyRepository = createPropertyRepository(
+  process.env.SQLITE_PATH?.trim() || undefined,
+);
+
+export type { Property, PropertyStore };

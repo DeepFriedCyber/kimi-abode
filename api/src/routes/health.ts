@@ -1,164 +1,110 @@
 /**
- * Health check routes — Service monitoring and status aggregation.
+ * Health endpoints.
+ *
+ * - GET /health            liveness only (no downstream calls)
+ * - GET /health/ready      readiness (database + AI service)
+ * - GET /api/health        aggregate status for the frontend
+ * - GET /health/ai         AI service only
+ * - GET /health/database   property store only
  */
 
-import type { FastifyPluginCallback } from "fastify";
-import { PropertyRepository } from "../db/property-repository";
+import type { FastifyPluginAsync } from "fastify";
+import { propertyRepository } from "../db/property-repository";
+import { config } from "../config";
 
-interface HealthRoutesOptions {
+export interface HealthRoutesOptions {
   aiServiceUrl: string;
 }
 
-// ---- Types -------------------------------------------------------------------
+type Status = "healthy" | "degraded" | "unhealthy";
 
 interface ServiceHealth {
   name: string;
-  status: "healthy" | "unhealthy" | "degraded";
+  status: Status;
   details?: Record<string, unknown>;
 }
 
-interface HealthResponse {
-  timestamp: number;
-  version: string;
-  services: {
-    database: ServiceHealth;
-    ai_service: ServiceHealth;
-  };
-  status: "healthy" | "unhealthy";
+const startedAt = Date.now();
+
+async function checkDatabase(): Promise<ServiceHealth> {
+  try {
+    const count = await propertyRepository.count();
+    return {
+      name: "database",
+      status: "healthy",
+      details: { property_count: count, driver: propertyRepository.driver },
+    };
+  } catch (error) {
+    return {
+      name: "database",
+      status: "unhealthy",
+      details: { error: error instanceof Error ? error.message : "unknown" },
+    };
+  }
 }
 
-// ---- Helper functions --------------------------------------------------------
-
-/** Check AI service health by HTTP request */
-async function checkAiServiceHealth(aiServiceUrl: string): Promise<ServiceHealth> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 2000);
+async function checkAiService(aiServiceUrl: string): Promise<ServiceHealth> {
   try {
-    const response = await fetch(`${aiServiceUrl}/health`, { signal: controller.signal });
-    
-    if (response.ok) {
-      clearTimeout(timeoutId);
-      return { name: "ai_service", status: "healthy" };
-    } else {
-      clearTimeout(timeoutId);
-      console.warn("[HealthCheck] AI service returned non-OK status:", response.status);
-      return { name: "ai_service", status: "degraded" };
-    }
-  } catch (err) {
-    clearTimeout(timeoutId);
-    const errorMsg = err instanceof Error ? err.message : "Unknown error";
-    console.warn(`[HealthCheck] Cannot reach AI service at ${aiServiceUrl}: ${errorMsg}`);
+    const response = await fetch(`${aiServiceUrl}/health`, {
+      signal: AbortSignal.timeout(2_000),
+    });
+    return {
+      name: "ai_service",
+      status: response.ok ? "healthy" : "degraded",
+      details: { http_status: response.status },
+    };
+  } catch {
     return { name: "ai_service", status: "degraded" };
   }
 }
 
-/** Check PostgreSQL or SQLite connectivity. */
-async function checkDatabaseHealth(): Promise<ServiceHealth> {
-  const repo = new PropertyRepository();
-  
-  // Try to get property count (non-invasive health check)
-  try {
-    const count = await repo.count();
-    
-    if (count > 0) {
-      return {
-        name: "database",
-        status: "healthy",
-        details: {
-          property_count: count,
-        },
-      };
-    } else {
-      console.warn("[HealthCheck] Database connected but no properties found");
-      return {
-        name: "database",
-        status: "degraded",
-        details: {
-          property_count: 0,
-        },
-      };
-    }
-  } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : "Unknown error";
-    console.warn(`[HealthCheck] Database health check failed: ${errorMsg}`);
-    
-    // Check if it's a connection error vs other error
-    if (errorMsg.includes("ECONNREFUSED") || errorMsg.includes("connection")) {
-      return { name: "database", status: "unhealthy" };
-    }
-    
-    // Note: If connection attempt fails, we return unhealthy below
-    return { name: "database", status: "unhealthy" };
-  }
+function aggregate(db: ServiceHealth, ai: ServiceHealth): { status: Status; services: Record<string, ServiceHealth> } {
+  const status: Status =
+    db.status === "healthy" && ai.status === "healthy"
+      ? "healthy"
+      : db.status === "unhealthy"
+        ? "unhealthy"
+        : "degraded";
+
+  return {
+    status,
+    services: { database: db, ai_service: ai },
+  };
 }
 
-// ---- routes ------------------------------------------------------------------
-
-export const healthRoutes: FastifyPluginCallback<HealthRoutesOptions> = async (app, opts) => {
+export const healthRoutes: FastifyPluginAsync<HealthRoutesOptions> = async (app, opts) => {
   const aiServiceUrl = opts.aiServiceUrl;
 
-  // ---- Aggregate health check endpoint ----------------------------------------
+  app.get("/health", async () => ({
+    status: "ok",
+    version: config.version,
+    uptime_seconds: Math.round((Date.now() - startedAt) / 1000),
+    timestamp: new Date().toISOString(),
+  }));
 
-  /**
-   * GET /health — Returns overall service status.
-   * 
-   * Response includes:
-   * - timestamp: Unix timestamp in ms
-   * - version: API server version
-   * - services: Health status of each backend service
-   * - status: "healthy" if all services pass, "unhealthy" otherwise
-   */
-  app.get<{ Querystring?: {} }>("/health", async () => {
-    const timestamp = Date.now();
-    
-    // Check database connectivity
-    const dbHealth = await checkDatabaseHealth();
-    
-    // Check AI service health
-    const aiHealth = await checkAiServiceHealth(aiServiceUrl);
-    
-    const overallStatus = dbHealth.status === "healthy" && aiHealth.status === "healthy" 
-      ? "healthy" 
-      : "unhealthy";
-
+  const aggregateHandler = async () => {
+    const [db, ai] = await Promise.all([checkDatabase(), checkAiService(aiServiceUrl)]);
     return {
-      timestamp,
-      version: "0.1.0",
-      services: {
-        database: dbHealth,
-        ai_service: aiHealth,
-      },
-      status: overallStatus,
-    } as HealthResponse;
-  });
-
-  /** Check only AI service health (for external monitoring). */
-  app.get<{ Querystring?: {} }>("/health/ai", async () => {
-    return {
-      timestamp: Date.now(),
-      version: "0.1.0",
-      name: "ai_service",
-      status: await new Promise<ServiceHealth>((resolve) => {
-        const aiHealth = checkAiServiceHealth(aiServiceUrl);
-        resolve(aiHealth);
-      }),
+      ...aggregate(db, ai),
+      version: config.version,
+      timestamp: new Date().toISOString(),
     };
+  };
+
+  // Readiness probe: 503 when a dependency is unhealthy.
+  app.get("/health/ready", async (_request, reply) => {
+    const [db, ai] = await Promise.all([checkDatabase(), checkAiService(aiServiceUrl)]);
+    const result = aggregate(db, ai);
+    return reply.code(result.status === "unhealthy" ? 503 : 200).send(result);
   });
 
-  /** Check only database health (for external monitoring). */
-  app.get<{ Querystring?: {} }>("/health/database", async () => {
-    return {
-      timestamp: Date.now(),
-      version: "0.1.0",
-      name: "database",
-      status: await new Promise<ServiceHealth>((resolve) => {
-        const dbHealth = checkDatabaseHealth();
-        resolve(dbHealth);
-      }),
-      details: (await new Promise<ServiceHealth>(async (resolve) => {
-        const dbHealth = await checkDatabaseHealth();
-        resolve(dbHealth);
-      })).details,
-    };
-  });
+  // Frontend-facing aggregate (always 200 so the UI can show a partial state).
+  app.get("/api/health", aggregateHandler);
+  app.get("/health/status", aggregateHandler);
+
+  app.get("/health/ai", async () => checkAiService(aiServiceUrl));
+
+  app.get("/health/database", async () => checkDatabase());
 };
+
+export default healthRoutes;

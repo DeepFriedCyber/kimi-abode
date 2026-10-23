@@ -1,44 +1,74 @@
 /**
- * Database repository interfaces shared across storage backends.
+ * Property domain types and the in-memory store implementation.
+ *
+ * This is the single in-memory implementation used by every layer (the API
+ * gateway and tests). Storage backends implement the same `PropertyStore`
+ * contract.
  */
 
 export interface Property {
   id: number;
-  address_line1?: string;
+  address_line1: string;
   address_line2?: string | null;
   town?: string | null;
   postcode?: string | null;
   outcode?: string | null;
-  property_type?: string;
-  num_beds?: number;
-  price_paid?: number;
-  date_sold?: string | Date;
+  property_type?: string | null;
+  num_beds?: number | null;
+  price_paid?: number | null;
+  date_sold?: string | Date | null;
   latitude?: number | null;
   longitude?: number | null;
-  source?: string;
+  source?: string | null;
 }
 
 export interface PropertyStore {
+  readonly driver: string;
   getAll(): Promise<Property[]>;
   getLimited(limit: number): Promise<Property[]>;
   count(): Promise<number>;
   find(query: string): Promise<Property[]>;
   upsert(property: Partial<Property>): Promise<number>;
-  clear?: () => Promise<void>;
+  clear(): Promise<void>;
 }
 
-// ---- In-memory property store (default implementation) ----------------------
+/** Stable identity for deduplication: address + postcode, case-insensitive. */
+export function propertyKey(property: Partial<Property>): string {
+  const address = (property.address_line1 ?? "").trim().toLowerCase();
+  const postcode = (property.postcode ?? "").trim().toLowerCase();
+  return `${address}|${postcode}`;
+}
+
+function searchBlob(property: Property): string {
+  return [
+    property.address_line1,
+    property.address_line2,
+    property.town,
+    property.postcode,
+    property.outcode,
+    property.property_type,
+    property.source,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
 export class InMemoryPropertyStore implements PropertyStore {
-  private properties: Map<number, Property> = new Map();
-  private counter = 1;
+  readonly driver = "memory";
+
+  private readonly properties = new Map<number, Property>();
+  private readonly idsByKey = new Map<string, number>();
+  private readonly blobs = new Map<number, string>();
+  private nextId = 1;
 
   async getAll(): Promise<Property[]> {
-    return Array.from(this.properties.values());
+    return [...this.properties.values()];
   }
 
   async getLimited(limit: number): Promise<Property[]> {
-    const all = await this.getAll();
-    return all.slice(0, limit);
+    const safeLimit = Math.max(0, Math.floor(limit));
+    return [...this.properties.values()].slice(0, safeLimit);
   }
 
   async count(): Promise<number> {
@@ -46,42 +76,52 @@ export class InMemoryPropertyStore implements PropertyStore {
   }
 
   async find(query: string): Promise<Property[]> {
-    const q = query.toLowerCase();
+    const needle = query.trim().toLowerCase();
+    if (!needle) return [];
+
     const matches: Property[] = [];
-    for (const prop of this.properties.values()) {
-      const text = JSON.stringify(prop).toLowerCase();
-      if (text.includes(q)) {
-        matches.push(prop);
+    for (const [id, property] of this.properties) {
+      if (this.blobs.get(id)?.includes(needle)) {
+        matches.push(property);
+        if (matches.length >= 50) break;
       }
     }
-
-    return matches.slice(0, 50);
+    return matches;
   }
 
-  async upsert(property: Partial<Property>): Promise<number> {
-    const id = this.counter++;
-    const prop: Property = {
+  async upsert(input: Partial<Property>): Promise<number> {
+    const key = propertyKey(input);
+    const existingId = this.idsByKey.get(key);
+
+    const id = existingId ?? input.id ?? this.nextId++;
+    if (id >= this.nextId) this.nextId = id + 1;
+
+    const existing = existingId !== undefined ? this.properties.get(existingId) : undefined;
+    const merged: Property = {
+      ...existing,
+      ...stripUndefined(input),
       id,
-      address_line1: property.address_line1 ?? "",
-      address_line2: property.address_line2 ?? null,
-      town: property.town ?? null,
-      postcode: property.postcode ?? null,
-      outcode: property.outcode ?? null,
-      property_type: property.property_type ?? "detached",
-      num_beds: property.num_beds ?? 2,
-      price_paid: property.price_paid ?? 300000,
-      date_sold: property.date_sold ? new Date(property.date_sold) : new Date(),
-      latitude: property.latitude ?? null,
-      longitude: property.longitude ?? null,
-      source: property.source ?? "land-registry",
+      address_line1: input.address_line1 ?? existing?.address_line1 ?? "",
+      property_type: input.property_type ?? existing?.property_type ?? "unknown",
+      source: input.source ?? existing?.source ?? "land-registry",
     };
 
-    this.properties.set(id, prop);
+    this.properties.set(id, merged);
+    this.idsByKey.set(key, id);
+    this.blobs.set(id, searchBlob(merged));
     return id;
   }
 
   async clear(): Promise<void> {
     this.properties.clear();
+    this.idsByKey.clear();
+    this.blobs.clear();
+    this.nextId = 1;
   }
 }
 
+function stripUndefined<T extends object>(value: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, v]) => v !== undefined),
+  ) as Partial<T>;
+}

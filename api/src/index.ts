@@ -1,31 +1,51 @@
 /**
- * Main entry point — bootstraps the Fastify server with WebSocket support.
+ * Process entry point: build the app, attach Socket.IO, listen, shut down
+ * cleanly on SIGINT/SIGTERM.
  */
 
-import { config, validateConfig, validateDatabaseUrl } from './config';
-import { buildApp } from './app';
-import { attachChatSocket } from './ws/chat.socket';
+import { buildApp } from "./app";
+import { config, validateConfig } from "./config";
+import { attachChatSocket } from "./ws/chat.socket";
 
-
-async function main() {
-  console.log('[API] Environment variables loaded');
+async function main(): Promise<void> {
   validateConfig();
-  validateDatabaseUrl();
 
   const app = await buildApp();
-
-  // Ensure the Fastify app is ready before attaching Socket.IO
   await app.ready();
 
-  // Attach WebSocket bridge for real-time chat - pass HTTP server directly
-  attachChatSocket(app.server, { corsOrigin: config.corsOrigin });
+  attachChatSocket(app.server, {
+    aiUrl: config.aiServiceUrl,
+    corsOrigin: config.corsOrigins,
+  });
 
-  const port = config.port;
-  await app.listen({ port, host: "0.0.0.0" });
-  console.log(`Abode API server listening on http://localhost:${port}`);
+  await app.listen({ port: config.port, host: config.host });
+  app.log.info(
+    { port: config.port, aiServiceUrl: config.aiServiceUrl },
+    "Abode API listening",
+  );
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    app.log.info({ signal }, "Shutting down");
+    try {
+      await app.close();
+      process.exit(0);
+    } catch (error) {
+      app.log.error({ err: error }, "Error during shutdown");
+      process.exit(1);
+    }
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("unhandledRejection", (reason) => {
+    app.log.error({ err: reason }, "Unhandled promise rejection");
+  });
 }
 
-main().catch((err) => {
-  console.error("Failed to start API server:", err);
+main().catch((error) => {
+  console.error("Failed to start API server:", error);
   process.exit(1);
 });

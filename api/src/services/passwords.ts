@@ -1,100 +1,117 @@
 /**
- * Password hashing and verification using bcrypt (server-side).
+ * Password hashing, verification and policy.
+ *
+ * Policy follows NIST SP 800-63B: favour length and blocklist screening over
+ * composition rules ("must contain a symbol"), which push users toward
+ * predictable patterns. bcrypt silently truncates at 72 bytes, so that is the
+ * enforced upper bound.
  */
 
-import bcrypt from 'bcryptjs';
+import bcrypt from "bcryptjs";
 
-const SALT_ROUNDS = 12; // Higher rounds for production security
+const BCRYPT_COST = 12;
+const MIN_LENGTH = 12;
+const MAX_BYTES = 72; // bcrypt input limit
 
 /**
- * Hash a password with bcrypt.
- * @param password - The plain text password.
- * @returns The hashed password as a string.
+ * A valid bcrypt hash used only to equalise timing when an account does not
+ * exist (prevents user enumeration via response time).
  */
+export const DUMMY_PASSWORD_HASH =
+  "$2a$12$gIQ4d7QYZTPSBv6e3q3nSOs7qpPOBRF1VivSDECcPKFoSfgaPAEte";
+
+// Small local blocklist. In production, prefer a breached-password service
+// (HIBP k-anonymity) over a static list.
+const COMMON_PASSWORDS = new Set([
+  "password", "password1", "password123", "123456789012", "qwertyuiop",
+  "letmein123", "welcome123", "admin1234567", "iloveyou123", "changeme123",
+  "trustno1", "abc123456789", "monkey123456", "dragon123456",
+]);
+
 export async function hashPassword(password: string): Promise<string> {
-  return await bcrypt.hash(password, SALT_ROUNDS);
+  return bcrypt.hash(password, BCRYPT_COST);
 }
 
-/**
- * Compare a plain text password with a hashed password.
- * @param password - The plain text password.
- * @param hashedPassword - The pre-hashed password stored in the database.
- * @returns True if the passwords match.
- */
-export async function comparePassword(
+export async function verifyPassword(
   password: string,
-  hashedPassword: string
+  passwordHash: string,
 ): Promise<boolean> {
-  return await bcrypt.compare(password, hashedPassword);
+  try {
+    return await bcrypt.compare(password, passwordHash);
+  } catch {
+    // Malformed hash: treat as a failed login rather than a 500.
+    return false;
+  }
+}
+
+/** Kept for backwards compatibility with earlier call sites. */
+export const comparePassword = verifyPassword;
+
+export interface PasswordValidation {
+  valid: boolean;
+  message?: string;
 }
 
 /**
- * Validate a password meets minimum requirements.
- * @param password - The password to validate.
- * @returns Object with validity status and message.
+ * Validate a candidate password.
+ *
+ * @param password - plaintext candidate
+ * @param context  - optional user-supplied values (email, name) that must not
+ *                   be contained in the password
  */
-export async function validatePassword(password: string): Promise<{ valid: boolean; message?: string }> {
-  // Length requirement - modern standard is 12+ characters
-  if (password.length < 12) {
-    return { 
-      valid: false, 
-      message: `Password must be at least ${12} characters` 
+export function validatePassword(
+  password: string,
+  context: { email?: string; name?: string } = {},
+): PasswordValidation {
+  if (typeof password !== "string" || password.length < MIN_LENGTH) {
+    return {
+      valid: false,
+      message: `Password must be at least ${MIN_LENGTH} characters.`,
     };
   }
-  
-  // Check for complexity requirements
-  const hasUppercase = /[A-Z]/.test(password);
-  const hasLowercase = /[a-z]/.test(password);
-  const hasNumber = /[0-9]/.test(password);
-  const hasSpecialChar = /[^A-Za-z0-9]/.test(password);
-  
-  if (!hasUppercase) {
-    return { valid: false, message: 'Password must contain at least one uppercase letter' };
+
+  if (password.length > MAX_BYTES || Buffer.byteLength(password, "utf8") > MAX_BYTES) {
+    return {
+      valid: false,
+      message: `Password must be at most ${MAX_BYTES} bytes.`,
+    };
   }
-  
-  if (!hasLowercase) {
-    return { valid: false, message: 'Password must contain at least one lowercase letter' };
+
+  const normalised = password.trim().toLowerCase();
+
+  if (COMMON_PASSWORDS.has(normalised)) {
+    return {
+      valid: false,
+      message: "Password is too common. Choose something less predictable.",
+    };
   }
-  
-  if (!hasNumber) {
-    return { valid: false, message: 'Password must contain at least one number' };
+
+  const localPart = context.email?.split("@")[0]?.toLowerCase();
+  if (localPart && localPart.length >= 3 && containsToken(normalised, localPart)) {
+    return {
+      valid: false,
+      message: "Password must not contain your email address.",
+    };
   }
-  
-  if (!hasSpecialChar) {
-    return { valid: false, message: 'Password must contain at least one special character' };
-  }
-  
-  // Check for common passwords
-  const COMMON_PASSWORDS = ['password', '123456', 'admin', 'welcome', 'monkey'];
-  if (COMMON_PASSWORDS.some(c => password.toLowerCase().includes(c))) {
-    return { valid: false, message: 'Password cannot contain common words or numbers' };
-  }
-  
-  // Check for adjacent keyboard keys (e.g., "qwerty")
-  const ADJACENT_KEYS = [
-    ['q', 'w', 'e', 'r', 't', 'y'],
-    ['z', 'x', 'c', 'v', 'b', 'n', 'm'],
-    ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0']
-  ];
-  
-  const lowercasePassword = password.toLowerCase();
-  for (const adjacent of ADJACENT_KEYS) {
-    if (adjacent.length >= 3) {
-      const pattern = new RegExp('[' + adjacent.join('|') + `]{${adjacent.length - 2},}`, 'i');
-      if (pattern.test(lowercasePassword)) {
-        return { 
-          valid: false, 
-          message: 'Password should not contain adjacent keyboard key patterns' 
-        };
-      }
+
+  if (context.name) {
+    const name = context.name.trim().toLowerCase();
+    if (name.length >= 4 && containsToken(normalised, name)) {
+      return {
+        valid: false,
+        message: "Password must not contain your name.",
+      };
     }
   }
-  
-  // Check for repeated characters
-  const REPEATED_PATTERN = /(.)\1{2,}/;
-  if (REPEATED_PATTERN.test(password)) {
-    return { valid: false, message: 'Password cannot contain three or more repeated characters' };
-  }
-  
+
   return { valid: true };
+}
+
+/**
+ * Whole-token containment check. Avoids false positives such as a user named
+ * "Test" being rejected for the password "…for testing".
+ */
+function containsToken(haystack: string, needle: string): boolean {
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "i").test(haystack);
 }

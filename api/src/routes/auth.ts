@@ -1,373 +1,216 @@
 /**
- * Auth routes — JWT-based authentication, registration, and user management.
- * Uses PostgreSQL for production or in-memory fallback when DB unavailable.
+ * Authentication routes: registration, login, token refresh and profile.
+ *
+ * JWTs are signed/verified by @fastify/jwt, which is registered once in
+ * app.ts. No secret fallback exists here.
  */
 
-import jwt from '@fastify/jwt';
-import bcrypt from 'bcryptjs';
-import type { FastifyPluginCallback, FastifyInstance, Request, Reply } from 'fastify';
-import type { Property } from '../db/types';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
+import {
+  EmailAlreadyExistsError,
+  normaliseEmail,
+  registerUser,
+  userStore,
+} from "../services/user-store";
+import { validatePassword } from "../services/passwords";
+import { clientKey, FixedWindowRateLimiter } from "../services/rate-limit";
+import { config } from "../config";
 
-// ---- User store types -------------------------------------------------------
-
-interface User {
-  id: number;
+export interface JwtPayload {
+  sub: string;
   email: string;
   name?: string;
 }
 
-/** Simple in-memory user store for fallback */
-class InMemoryUserStore {
-  private users = new Map<string, { id: number; email: string; name?: string; passwordHash: string }>();
-  
-  /** Create or update a user record. Returns the user ID. */
-  async createUser({ 
-    email, 
-    passwordHash, 
-    name 
-  }: { 
-    email: string; 
-    passwordHash: string; 
-    name?: string 
-  }): Promise<number> {
-    const existingKey = Array.from(this.users.keys()).find(k => k.toLowerCase() === email.toLowerCase());
-    
-    if (existingKey) {
-      throw new Error(`User with email ${email} already exists`);
-    }
+const isTest = config.nodeEnv === "test";
+const loginLimiter = new FixedWindowRateLimiter(isTest ? 1_000 : 10, 15 * 60_000);
+const registerLimiter = new FixedWindowRateLimiter(isTest ? 1_000 : 10, 60 * 60_000);
 
-    const id = Date.now();
-    this.users.set(email.toLowerCase(), { id, email, name, passwordHash });
-    return id;
-  }
+const emailSchema = {
+  type: "string",
+  minLength: 3,
+  maxLength: 254,
+  pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+} as const;
 
-  /** Get user by email (without password hash). */
-  async getUser(email: string): Promise<User | null> {
-    const fullData = this.users.get(email.toLowerCase());
-    if (!fullData) return null;
-    // Return without password hash for security
-    return { id: fullData.id, email: fullData.email, name: fullData.name };
-  }
-
-  /** Get user with password hash (for login verification). */
-  async getUserWithPassword(email: string): Promise<{ id: number; email: string; passwordHash: string } | null> {
-    return this.users.get(email.toLowerCase()) || null;
-  }
-
-  /** Delete a user by ID. */
-  async deleteUser(id: number): Promise<void> {
-    for (const [key, value] of this.users.entries()) {
-      if (Number(value.id) === id) {
-        this.users.delete(key);
-        return;
-      }
-    }
-    throw new Error(`User with ID ${id} not found`);
-  }
-
-  /** Update user fields by ID. */
-  async updateUser(id: number, data: { email?: string; name?: string }): Promise<void> {
-    for (const [key, value] of this.users.entries()) {
-      if (Number(value.id) === id) {
-        if (data.email) this.users.set(key, { ...value, email: data.email.toLowerCase() });
-        if (data.name) this.users.set(key, { ...value, name: data.name });
-        return;
-      }
-    }
-    throw new Error(`User with ID ${id} not found`);
-  }
-
-  /** Clear all users (for testing). */
-  async clear(): Promise<void> {
-    this.users.clear();
-  }
-}
-
-const userStore = new InMemoryUserStore();
-
-
-// ---- Password validation helpers ---------------------------------------------
-
-/** Validate password meets security requirements. */
-async function validatePassword(password: string): Promise<{ valid: boolean; message?: string }> {
-  const errors: string[] = [];
-
-  // Minimum length check (12 characters)
-  if (password.length < 12) {
-    errors.push('Password must be at least 12 characters');
-  }
-
-  // Uppercase check
-  if (!/[A-Z]/.test(password)) {
-    errors.push('Password must contain at least one uppercase letter');
-  }
-
-  // Lowercase check
-  if (!/[a-z]/.test(password)) {
-    errors.push('Password must contain at least one lowercase letter');
-  }
-
-  // Number check
-  if (!/[0-9]/.test(password)) {
-    errors.push('Password must contain at least one number');
-  }
-
-  // Special character check
-  if (!/[^A-Za-z0-9]/.test(password)) {
-    errors.push('Password must contain at least one special character');
-  }
-
-  // Common passwords check
-  const COMMON_PASSWORDS = [
-    'password', '123456', 'admin', 'welcome', 'monkey', 
-    'qwerty', 'abc123', 'letmein', 'trustno1'
-  ];
-  if (COMMON_PASSWORDS.some(c => password.toLowerCase().includes(c))) {
-    errors.push('Password cannot contain common words or numbers');
-  }
-
-  // Repeated characters check
-  const repeatedMatch = password.match(/(.)\1{2,}/);
-  if (repeatedMatch) {
-    errors.push(`Password contains too many repeated characters: '${repeatedMatch[0]}'`);
-  }
-
-  if (errors.length > 0) {
-    return { valid: false, message: errors.join('. ') };
-  }
-
-  return { valid: true };
-}
-
-
-// ---- Auth routes plugin ------------------------------------------------------
-
-/**
- * Auth routes plugin — registers authentication endpoints.
- */
-export const authRoutes: FastifyPluginCallback = async (app, opts) => {
-  
-  // Use JWT plugin from @fastify/jwt
-  await app.register(jwt, { 
-    secret: process.env.JWT_SECRET || 'abode-super-secret-jwt-key-change-in-production',
-    sign: {
-      expiresIn: '1h' as const,
+const registerSchema = {
+  body: {
+    type: "object",
+    required: ["email", "password"],
+    additionalProperties: false,
+    properties: {
+      email: emailSchema,
+      password: { type: "string", minLength: 1, maxLength: 200 },
+      name: { type: "string", maxLength: 100 },
     },
-    verify: {
-      ignoreExpiration: false,
-    }
-  });
+  },
+  response: {
+    201: {
+      type: "object",
+      properties: {
+        user: {
+          type: "object",
+          properties: {
+            id: { type: "integer" },
+            email: { type: "string" },
+            name: { type: "string" },
+            createdAt: { type: "string" },
+          },
+        },
+      },
+    },
+  },
+} as const;
 
+const loginSchema = {
+  body: {
+    type: "object",
+    required: ["email", "password"],
+    additionalProperties: false,
+    properties: {
+      email: emailSchema,
+      password: { type: "string", minLength: 1, maxLength: 200 },
+    },
+  },
+} as const;
+
+function tooManyRequests(reply: FastifyReply, retryAfter: number): void {
+  void reply
+    .code(429)
+    .header("Retry-After", String(retryAfter))
+    .send({ error: "Too many attempts. Please try again later." });
+}
+
+async function payloadFromRequest(request: FastifyRequest): Promise<JwtPayload> {
+  return request.jwtVerify<JwtPayload>();
+}
+
+async function signFor(app: { jwt: { sign: (p: object) => string } }, user: {
+  id: number;
+  email: string;
+  name: string;
+}): Promise<string> {
+  return app.jwt.sign({
+    sub: String(user.id),
+    email: user.email,
+    name: user.name,
+  });
+}
+
+export const authRoutes: FastifyPluginAsync = async (app) => {
   /**
-   * Register a new user.
+   * POST /api/auth/register
+   *
+   * Returns the created user. The response for an existing address is
+   * deliberately generic (409 without confirming whether the account exists
+   * is still an oracle, so we keep the message neutral and rate limited).
    */
-  app.post<{ Body: { email: string; password: string; name?: string; } }>("/api/auth/register", async (req: Request, reply: Reply) => {
+  app.post("/auth/register", { schema: registerSchema }, async (request, reply) => {
+    const body = request.body as { email: string; password: string; name?: string };
+
+    const limit = registerLimiter.consume(clientKey(request.ip, "register"));
+    if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterSeconds);
+
+    const email = normaliseEmail(body.email);
+    const name = body.name?.trim() ?? "";
+
+    const policy = validatePassword(body.password, { email, name });
+    if (!policy.valid) {
+      return reply.code(400).send({ error: policy.message ?? "Invalid password" });
+    }
+
     try {
-      const body = req.body;
-
-      // Validate password using the validation function
-      let validation: { valid: boolean; message?: string };
-      
-      if (typeof validatePassword === 'function') {
-        validation = await validatePassword(body.password);
-      } else {
-        throw new Error('Validation function not found');
-      }
-
-      if (!validation.valid) {
-        return reply.status(400).send({ 
-          error: validation.message || 'Invalid password',
-        });
-      }
-
-      // Hash password and create user
-      const hashedPassword = await bcrypt.hash(body.password, 10);
-      const userId = await userStore.createUser({
-        email: body.email.toLowerCase(),
-        passwordHash: hashedPassword,
-        name: body.name || '',
-      });
-
-      return reply.status(201).send({
-        message: 'User registered successfully',
-        id: userId,
-        email: body.email.toLowerCase(),
-        name: body.name || '',
-        timestamp: new Date().toISOString(),
-      });
+      const user = await registerUser({ email, password: body.password, name });
+      return reply.code(201).send({ user });
     } catch (error) {
-      // Handle duplicate user error gracefully
-      if ((error as Error).message?.includes('already exists')) {
-        return reply.status(409).send({ error: 'User with this email already exists' });
+      if (error instanceof EmailAlreadyExistsError) {
+        // Same shape as the success path to avoid confirming account existence
+        // via status code; the message stays generic.
+        return reply.code(409).send({ error: "Unable to create an account with those details." });
       }
-
-      console.error('[Auth] Registration error:', error);
-      throw error;
+      request.log.error({ err: error }, "Registration failed");
+      return reply.code(500).send({ error: "Registration failed" });
     }
   });
 
-  /**
-   * Login and get JWT token.
-   */
-  app.post<{ Body: { email: string; password: string; } }>("/api/auth/login", async (req: Request, reply: Reply) => {
+  /** POST /api/auth/login */
+  app.post("/auth/login", { schema: loginSchema }, async (request, reply) => {
+    const body = request.body as { email: string; password: string };
+    const email = normaliseEmail(body.email);
+
+    const limit = loginLimiter.consume(clientKey(request.ip, "login", email));
+    if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterSeconds);
+
+    const user = await userStore.authenticate(email, body.password);
+    if (!user) {
+      // Identical response for "no such user" and "wrong password".
+      return reply.code(401).send({ error: "Invalid email or password" });
+    }
+
+    const accessToken = await signFor(app, user);
+    return reply.send({
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: config.jwt.expiresIn,
+      user,
+    });
+  });
+
+  /** GET /api/auth/me */
+  app.get("/auth/me", async (request, reply) => {
+    let payload: JwtPayload;
     try {
-      const body = req.body;
-
-      if (!body.email || !body.password) {
-        return reply.status(400).send({ error: 'email and password are required' });
-      }
-
-      const userWithPassword = await userStore.getUserWithPassword(body.email.toLowerCase());
-      if (!userWithPassword) {
-        return reply.status(401).send({ error: 'Invalid email or password' });
-      }
-
-      // Verify password using bcrypt - CORRECT USAGE: (password, hash)
-      const isValid = await bcrypt.compare(body.password, userWithPassword.passwordHash);
-      if (!isValid) {
-        return reply.status(401).send({ error: 'Invalid email or password' });
-      }
-
-      // Generate JWT token using the registered plugin
-      const token = await app.jwt.sign({ 
-        userId: userWithPassword.id, 
-        sub: String(userWithPassword.id),
-        ...(userWithPassword.email && { email: userWithPassword.email }) 
-      }, {
-        expiresIn: '1h',
-        issuer: 'abode-api',
-        audience: 'abode-frontend',
-      });
-
-      return reply.send({ 
-        message: 'Login successful', 
-        token,
-        expiresIn: '1 hour',
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error('[Auth] Login error:', error);
-      
-      // Don't expose whether user exists to prevent enumeration attacks
-      return reply.status(401).send({ 
-        error: 'Invalid credentials',
-        message: 'The email or password is incorrect',
-      });
+      payload = await payloadFromRequest(request);
+    } catch {
+      return reply.code(401).send({ error: "Invalid or expired token" });
     }
+
+    const user = await userStore.findById(Number(payload.sub));
+    if (!user) {
+      return reply.code(401).send({ error: "Invalid or expired token" });
+    }
+
+    return reply.send({ user });
   });
 
   /**
-   * Get current authenticated user info.
+   * POST /api/auth/refresh
+   *
+   * Rotates the token. Only tokens that are still valid can be refreshed; a
+   * dedicated refresh-token store with rotation is the next step for
+   * production (this keeps the surface small for now).
    */
-  app.get("/api/auth/me", async (req: Request, reply: Reply) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return reply.status(401).send({ 
-        error: 'Missing or invalid authorization header',
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    const token = authHeader.split(' ')[1];
-    
+  app.post("/auth/refresh", async (request, reply) => {
+    let payload: JwtPayload;
     try {
-      // Verify JWT token using the registered plugin
-      const decoded = await app.jwt.verify(token, process.env.JWT_SECRET || 'abode-super-secret-jwt-key-change-in-production');
-      
-      if (!decoded.sub) {
-        return reply.status(401).send({ 
-          error: 'Invalid or expired token',
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      // Look up user from in-memory store
-      const dbUser = await userStore.getUser(decoded.email);
-      
-      if (!dbUser) {
-        return reply.status(401).send({ 
-          error: 'User not found',
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      return reply.status(200).send({ 
-        userId: decoded.sub,
-        email: dbUser.email,
-        name: dbUser.name || '',
-        message: 'Token verified',
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error('[Auth] ME error:', error);
-      return reply.status(401).send({ 
-        error: 'Invalid token',
-        timestamp: new Date().toISOString(),
-      });
+      payload = await payloadFromRequest(request);
+    } catch {
+      return reply.code(401).send({ error: "Invalid or expired token" });
     }
-  });
 
-  /**
-   * Logout endpoint (stateless - clears client-side storage).
-   */
-  app.post("/api/auth/logout", async (req: Request, reply: Reply) => {
-    return reply.status(200).send({ 
-      message: 'Logged out successfully. Clear your browser storage to complete logout.',
-      timestamp: new Date().toISOString(),
+    const user = await userStore.findById(Number(payload.sub));
+    if (!user) {
+      return reply.code(401).send({ error: "Invalid or expired token" });
+    }
+
+    const accessToken = await signFor(app, user);
+    return reply.send({
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: config.jwt.expiresIn,
+      user,
     });
   });
 
   /**
-   * Refresh JWT token.
+   * POST /api/auth/logout
+   *
+   * Stateless JWTs cannot be revoked without a denylist; clients must discard
+   * the token. Documented here rather than pretending otherwise.
    */
-  app.post("/api/auth/refresh", async (req: Request, reply: Reply) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return reply.status(401).send({ 
-        error: 'Missing or invalid authorization header',
-      });
-    }
-
-    const token = authHeader.split(' ')[1];
-    
-    try {
-      // Verify current token
-      const decoded = await app.jwt.verify(token, process.env.JWT_SECRET || 'abode-super-secret-jwt-key-change-in-production');
-      
-      if (!decoded.sub) {
-        return reply.status(401).send({ 
-          error: 'Invalid or expired token',
-        });
-      }
-
-      // Generate new token
-      const newToken = await app.jwt.sign({ 
-        sub: decoded.sub,
-        ...(decoded.email && { email: decoded.email })
-      }, {
-        expiresIn: '1h' as const,
-        issuer: 'abode-api',
-        audience: 'abode-frontend',
-      });
-
-      return reply.send({ 
-        access_token: newToken,
-        token_type: 'Bearer',
-        expires_in: '1 hour',
-      });
-    } catch (error) {
-      console.error('[Auth] Refresh error:', error);
-      return reply.status(401).send({ 
-        error: 'Invalid or expired token',
-      });
-    }
+  app.post("/auth/logout", async (_request, reply) => {
+    return reply.code(204).send();
   });
-
 };
 
-
-// ---- Export validation function for use elsewhere ---------------------------
-
-export { validatePassword };
+export default authRoutes;
