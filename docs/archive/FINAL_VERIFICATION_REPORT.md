@@ -255,7 +255,7 @@ _DB_POOL_MAX = 10
 JWT_SECRET=your-super-secret-key-here
 
 # After: ✅ Strong secret (64 characters)
-JWT_SECRET=REDACTED-JWT-SECRET
+JWT_SECRET=<ROTATE-ME-jwt-secret>
 ```
 
 #### 2. **Strong POI Injection Secret** (FIXED)
@@ -264,7 +264,7 @@ JWT_SECRET=REDACTED-JWT-SECRET
 POI_INJECTION_SECRET=your-super-secret-key-here-please-change-this-in-production
 
 # After: ✅ Strong secret (64 characters)
-POI_INJECTION_SECRET=REDACTED-POI-SECRET
+POI_INJECTION_SECRET=<ROTATE-ME-poi-key>
 ```
 
 **Remaining Security Tasks (Medium Priority):**

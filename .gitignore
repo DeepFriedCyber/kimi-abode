@@ -45,3 +45,15 @@ service-account-*.json
 keystore.jks
 *.pem
 *.key
+
+# Local databases and build artefacts
+*.db
+*.db-journal
+*.tsbuildinfo
+
+ai-service/data/agent_listings.json
+
+# OSM extracts are large; rebuild them with scripts/preload_pois.py
+*.osm.pbf
+ai-service/data/cache/
+ai-service/data/media/
