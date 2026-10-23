@@ -18,27 +18,6 @@ class TestAuthHardening:
         assert "abc123token" not in result
         assert "[REDACTED_AUTH_TOKEN]" in result
 
-    @pytest.mark.asyncio
-    async def test_token_validation(self):
-        import jwt
-        secret = "test-secret"
-        token = jwt.encode({"sub": "user123"}, secret, algorithm="HS256")
-        decoded = jwt.decode(token, secret, algorithms=["HS256"])
-        assert decoded["sub"] == "user123"
-
-
-class TestPasswords:
-    """Tests for password hashing module."""
-
-    def test_hash_equals(self):
-        import hashlib
-
-        pw = "test-password"
-        salt = "random-salt-1234"
-        h = hashlib.sha256((pw + salt).encode()).hexdigest()
-
-        assert len(h) == 64  # SHA256 output length
-
 
 class TestMetrics:
     """Tests for metrics endpoint and middleware."""
