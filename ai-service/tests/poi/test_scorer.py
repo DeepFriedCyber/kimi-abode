@@ -40,20 +40,50 @@ class TestPOIRouter:
     """Tests for the POI router endpoints."""
 
     @pytest.mark.asyncio
-    async def test_ingest_pois(self):
-        from app.routers.poi import router, ingest_pois
-        from fastapi import Request
-        from unittest.mock import MagicMock
+    async def test_ingest_pois(self, monkeypatch):
+        from types import SimpleNamespace
 
-        # Clear existing data
-        from app.routers.poi import set_poi_data
-        set_poi_data([])
+        from app.routers import poi
 
-        mock_request = MagicMock(spec=Request)
-        mock_request.headers = {}
-        result = await ingest_pois({"bbox": "53.0,-2.7,53.3,-2.1"}, mock_request)
-        assert isinstance(result, dict)
-        assert "ingested" in result
+        async def fake_fetch(bbox, categories=None):
+            return [
+                {"name": "School A", "osm_id": 1, "lat": 53.1, "lon": -2.4, "category": "school"},
+                {"name": "School A", "osm_id": 1, "lat": 53.1, "lon": -2.4, "category": "school"},
+                {"name": "The Pub", "osm_id": 2, "lat": 53.1, "lon": -2.4, "category": "pub"},
+            ]
+
+        monkeypatch.setattr(poi, "fetch_pois", fake_fetch)
+        monkeypatch.delenv("POI_INGEST_API_KEY", raising=False)
+        monkeypatch.delenv("POI_INJECTION_SECRET", raising=False)
+
+        poi.set_poi_data([])
+        request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+
+        result = await poi.ingest_pois({"bbox": "53.0,-2.7,53.3,-2.1"}, request)
+
+        assert result["ingested"] == 2  # duplicate (osm_id, category) collapsed
+        assert result["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_ingest_requires_the_configured_key(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+
+        from app.routers import poi
+
+        monkeypatch.setenv("POI_INGEST_API_KEY", "a-very-secret-key")
+        poi.set_poi_data([])
+
+        request = SimpleNamespace(
+            headers={"x-api-key": "wrong"},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        with pytest.raises(HTTPException) as excinfo:
+            await poi.ingest_pois({"bbox": "53.0,-2.7,53.3,-2.1"}, request)
+
+        assert excinfo.value.status_code == 401
 
 
 class TestPoiQA:
@@ -93,38 +123,6 @@ class TestAskRoutes:
         set_poi_data([])
         result = await nearby_pois(lat=53.0, lon=-2.4)
         assert "nearby" in result
-
-
-class TestAuthRoutes:
-    """Tests for authentication routes."""
-
-    @pytest.mark.asyncio
-    async def test_auth_routes_not_registered_without_db(self):
-        # Auth routes should not register when DATABASE_URL is not set
-        # This tests the conditional in api/src/app.ts
-        assert True  # Placeholder — full test requires Fastify client setup
-
-class TestPasswords:
-    """Tests for password hashing."""
-
-    def test_password_hashing_is_deterministic_with_same_salt(self):
-        import hashlib
-
-        salt = "test-salt"
-        pw1 = "password123"
-        pw2 = "password123"
-
-        h1 = hashlib.sha256((pw1 + salt).encode()).hexdigest()
-        h2 = hashlib.sha256((pw2 + salt).encode()).hexdigest()
-        assert h1 == h2
-
-    def test_different_passwords_have_different_hashes(self):
-        import hashlib
-
-        salt = "test-salt"
-        h1 = hashlib.sha256(("pass1" + salt).encode()).hexdigest()
-        h2 = hashlib.sha256(("pass2" + salt).encode()).hexdigest()
-        assert h1 != h2
 
 
 class TestObservabilityMetrics:

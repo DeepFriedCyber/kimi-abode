@@ -2,204 +2,228 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
-import random
 import time
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Request
-from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
+from fastapi import APIRouter, HTTPException, Query, Request
 
-from ..poi.scorer import decay_score, nearest, score_property
+from ..poi.overpass import fetch_pois
+from ..poi.scorer import annotate_distances, score_property
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ------------------------------------------------------------------ rate limiter
-_rate_window_ms: int = 60_000
-_rate_max: int = 20  # per window
+RATE_WINDOW_SECONDS = 60
+RATE_MAX_REQUESTS = 20
+MAX_STORED_POIS = 50_000
 
 
-class _RateLimiter:
-    """Simple thread-safe-enough per-IP in-memory rate limiter.
+class RateLimiter:
+    """Per-IP fixed-window limiter for the (expensive) ingest endpoint."""
 
-    Uses a cleanup sweep triggered on every call once the window elapses,
-    so stale IP buckets do not accumulate indefinitely.
-    """
-
-    def __init__(self, window_ms: int = _rate_window_ms, max_reqs: int = _rate_max):
-        self.window_ms = window_ms
-        self.max_reqs = max_reqs
+    def __init__(self, window_seconds: int = RATE_WINDOW_SECONDS, max_requests: int = RATE_MAX_REQUESTS):
+        self.window = window_seconds
+        self.max_requests = max_requests
         self._buckets: dict[str, list[float]] = {}
         self._last_cleanup = time.time()
 
-    def allow(self, ip: str) -> bool:
+    def allow(self, key: str) -> bool:
         now = time.time()
-        self._maybe_cleanup(now)
-        bucket = self._buckets.get(ip)
-        if bucket is None:
-            self._buckets[ip] = [now]
-            return True
-        cutoff = now - (self.window_ms / 1000)
-        bucket[:] = [t for t in bucket if t > cutoff]
-        if len(bucket) >= self.max_reqs:
+        self._cleanup(now)
+
+        bucket = self._buckets.setdefault(key, [])
+        cutoff = now - self.window
+        bucket[:] = [timestamp for timestamp in bucket if timestamp > cutoff]
+
+        if len(bucket) >= self.max_requests:
             return False
+
         bucket.append(now)
         return True
 
-    def _maybe_cleanup(self, now: float) -> None:
-        """Evict stale buckets periodically to prevent memory leaks."""
-        if now - self._last_cleanup < self.window_ms / 1000:
+    def _cleanup(self, now: float) -> None:
+        if now - self._last_cleanup < self.window:
             return
         self._last_cleanup = now
-        cutoff = now - (self.window_ms / 1000)
-        stale = [ip for ip, ts in self._buckets.items() if ts and ts[-1] < cutoff]
-        for ip in stale:
-            del self._buckets[ip]
+        cutoff = now - self.window
+        for key in [k for k, v in self._buckets.items() if not v or v[-1] < cutoff]:
+            del self._buckets[key]
 
 
-_rate_limiter = _RateLimiter()
+_rate_limiter = RateLimiter()
 
 
-def _get_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    client = request.client
-    return client.host if client else "unknown"
+def _trust_proxy() -> bool:
+    return os.getenv("TRUST_PROXY_HEADERS", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _client_ip(request: Request) -> str:
+    if _trust_proxy():
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 # ------------------------------------------------------------------ auth
-async def _check_auth(request: Request) -> None:
-    """Require X-API-Key header for write operations.
+def _expected_api_key() -> str:
+    # Support the legacy name so existing deployments do not silently lose auth.
+    return os.getenv("POI_INGEST_API_KEY") or os.getenv("POI_INJECTION_SECRET") or ""
 
-    When POI_INGEST_API_KEY is not set, auth is disabled and a warning is
-    logged. When set, the header must match exactly. The response behaviour
-    is identical for "key not configured" and "wrong key" to avoid leaking
-    configuration state through status codes.
+
+async def _check_auth(request: Request) -> None:
+    """Require X-API-Key for write operations.
+
+    Fails closed in production when no key is configured; allows local
+    development with a loud warning.
     """
-    api_key = request.headers.get("x-api-key", "")
-    expected = os.getenv("POI_INGEST_API_KEY", "")
+    expected = _expected_api_key()
     if not expected:
+        if os.getenv("ENVIRONMENT", os.getenv("NODE_ENV", "")).lower() == "production":
+            raise HTTPException(status_code=503, detail="POI ingest is not configured")
         logger.warning(
-            "PoI ingest authentication is DISABLED (POI_INGEST_API_KEY not set). "
-            "This is insecure for production deployments."
+            "POI ingest auth is DISABLED (set POI_INGEST_API_KEY). Local only."
         )
         return
-    if not api_key or api_key != expected:
-        raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
-            detail="Authentication required",
-        )
+
+    provided = request.headers.get("x-api-key", "")
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Authentication required")
 
 
-# ------------------------------------------------------------------ validation helpers
-VALID_BBOX_BOUNDS = (-90, -180, 90, 180)
+# ------------------------------------------------------------------ validation
+BBOX_LAT = (-90.0, 90.0)
+BBOX_LON = (-180.0, 180.0)
+MAX_BBOX_SPAN = 60.0
 
 
 def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
-    """Parse and validate bounding box string."""
-    parts = bbox.split(",")
+    parts = [part.strip() for part in bbox.split(",")]
     if len(parts) != 4:
-        raise HTTPException(status_code=400, detail="bbox must be lat_min,lon_min,lat_max,lon_max")
+        raise HTTPException(
+            status_code=400, detail="bbox must be lat_min,lon_min,lat_max,lon_max"
+        )
 
     try:
-        coords = [float(x) for x in parts]
+        lat_min, lon_min, lat_max, lon_max = (float(part) for part in parts)
     except ValueError:
-        raise HTTPException(status_code=400, detail="bbox values must be numbers")
+        raise HTTPException(status_code=400, detail="bbox values must be numbers") from None
 
-    lat_min, lon_min, lat_max, lon_max = coords
-
-    if not (VALID_BBOX_BOUNDS[0] <= lat_min <= VALID_BBOX_BOUNDS[2]):
-        raise HTTPException(status_code=400, detail="lat_min out of range [-90, 90]")
-    if not (VALID_BBOX_BOUNDS[1] <= lon_min <= VALID_BBOX_BOUNDS[3]):
-        raise HTTPException(status_code=400, detail="lon_min out of range [-180, 180]")
-    if not (VALID_BBOX_BOUNDS[0] <= lat_max <= VALID_BBOX_BOUNDS[2]):
-        raise HTTPException(status_code=400, detail="lat_max out of range [-90, 90]")
-    if not (VALID_BBOX_BOUNDS[1] <= lon_max <= VALID_BBOX_BOUNDS[3]):
-        raise HTTPException(status_code=400, detail="lon_max out of range [-180, 180]")
+    if not (BBOX_LAT[0] <= lat_min <= BBOX_LAT[1]) or not (BBOX_LAT[0] <= lat_max <= BBOX_LAT[1]):
+        raise HTTPException(status_code=400, detail="latitude out of range [-90, 90]")
+    if not (BBOX_LON[0] <= lon_min <= BBOX_LON[1]) or not (BBOX_LON[0] <= lon_max <= BBOX_LON[1]):
+        raise HTTPException(status_code=400, detail="longitude out of range [-180, 180]")
 
     if lat_min >= lat_max or lon_min >= lon_max:
-        raise HTTPException(status_code=400, detail="bbox must have min < max for both lat and lon")
+        raise HTTPException(status_code=400, detail="bbox must have min < max")
+    if (lat_max - lat_min) > MAX_BBOX_SPAN or (lon_max - lon_min) > MAX_BBOX_SPAN:
+        raise HTTPException(status_code=400, detail="bbox too large — split the query")
 
-    if (lat_max - lat_min) > 60 or (lon_max - lon_min) > 60:
-        raise HTTPException(status_code=400, detail="bbox too large — use multiple smaller queries")
-
-    return coords
+    return lat_min, lon_min, lat_max, lon_max
 
 
 # ------------------------------------------------------------------ runtime state
 _poi_data: list[dict[str, Any]] = []
 
 
-def set_poi_data(data: list[dict]):
+def set_poi_data(data: list[dict]) -> None:
     global _poi_data
-    _poi_data = data
+    _poi_data = list(data)
+
+
+def get_poi_data() -> list[dict[str, Any]]:
+    """Amenity cache (loaded from data/poi_cache.json at startup)."""
+    return _poi_data
 
 
 # ------------------------------------------------------------------ endpoints
 @router.post("/ingest")
 async def ingest_pois(body: dict, request: Request):
-    """Ingest POI data from Overpass API for a bounding box.
-
-    POST body: {"bbox": "lat_min,lon_min,lat_max,lon_max"}
-    Requires X-API-Key header when POI_INGEST_API_KEY is set.
-    """
+    """Ingest POIs from OpenStreetMap for a bounding box."""
     await _check_auth(request)
 
-    ip = _get_ip(request)
-    if not _rate_limiter.allow(ip):
-        raise HTTPException(status_code=429, detail="Too many ingest requests — try again later")
+    if not _rate_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many ingest requests")
 
-    bbox = body.get("bbox", "")
-    lat_min, lon_min, lat_max, lon_max = _parse_bbox(bbox)
+    bbox = _parse_bbox(str(body.get("bbox", "")))
 
-    # In production: query Overpass API
-    # For now: generate sample POIs in the bbox
-    rng = random.Random(hash(bbox))
+    pois = await fetch_pois(bbox)
+    if not pois:
+        return {
+            "ingested": 0,
+            "total": len(_poi_data),
+            "message": "Overpass returned no POIs for this bounding box",
+        }
 
-    categories = ["restaurant", "pub", "school", "supermarket", "hospital", "station"]
-    new_pois = []
-    for _ in range(50):
-        cat = rng.choice(categories)
-        new_pois.append({
-            "name": f"{cat.title()} {rng.randint(1, 200)}",
-            "osm_id": rng.randint(1_000_000, 9_999_999),
-            "lat": rng.uniform(lat_min, lat_max),
-            "lon": rng.uniform(lon_min, lon_max),
-            "category": cat,
-        })
+    seen = {(poi.get("osm_id"), poi.get("category")) for poi in _poi_data}
+    fresh: list[dict[str, Any]] = []
+    for poi in pois:
+        key = (poi.get("osm_id"), poi.get("category"))
+        if key in seen:
+            continue
+        seen.add(key)  # dedupe within the incoming batch as well as against stored data
+        fresh.append(poi)
 
-    _poi_data.extend(new_pois)
+    remaining = max(0, MAX_STORED_POIS - len(_poi_data))
+    _poi_data.extend(fresh[:remaining])
 
-    return {"ingested": len(new_pois), "total": len(_poi_data)}
+    return {"ingested": len(fresh[:remaining]), "total": len(_poi_data)}
 
 
 @router.get("/nearby")
-async def nearby_pois(lat: float, lon: float, category: str = "", n: int = 5):
-    """Get nearby POIs for a property."""
+async def nearby_pois(
+    lat: Annotated[float, Query(ge=-90, le=90)],
+    lon: Annotated[float, Query(ge=-180, le=180)],
+    category: str = "",
+    n: Annotated[int, Query(ge=1, le=50)] = 5,
+    radius: Annotated[int, Query(ge=50, le=50_000)] = 5_000,
+):
+    """Return the nearest POIs within `radius` metres, optionally by category."""
     if not _poi_data:
-        return {"nearby": [], "message": "No POI data ingested"}
+        return {"nearby": [], "category_scores": {}, "message": "No POI data ingested"}
 
-    nearest_points = nearest(_poi_data, lat, lon, n=max(n, 10))
-    scores = score_property(_poi_data, lat, lon)
+    # Filter first: taking the global nearest N and then filtering by category
+    # can return an empty list even when matching POIs exist.
+    category_pool = [
+        poi for poi in _poi_data if not category or poi.get("category") == category
+    ]
+    if not category_pool:
+        return {"nearby": [], "category_scores": {}, "message": "No POIs in that category"}
 
-    results = []
-    for pt in nearest_points:
-        if category and pt["category"] != category:
-            continue
-        results.append({
-            "name": pt["name"],
-            "category": pt["category"],
-            "distance_m": round(pt["distance_m"], 1),
-            "walk_time_min": max(1, round(pt["distance_m"] / 80)),
-            "decay_score": round(pt["decay_score"], 3),
-        })
+    # Distance-filter before slicing so a property outside the loaded area does
+    # not "see" amenities hundreds of kilometres away.
+    within_radius = [
+        point
+        for point in annotate_distances(category_pool, lat, lon)
+        if point["distance_m"] <= radius
+    ]
+    within_radius.sort(key=lambda point: point["distance_m"])
 
-    return {"nearby": results[:n], "category_scores": scores}
+    results = [
+        {
+            "name": point["name"],
+            "category": point["category"],
+            "distance_m": round(point["distance_m"], 1),
+            "walk_time_min": max(1, round(point["distance_m"] / 80)),
+            "decay_score": round(point["decay_score"], 3),
+        }
+        for point in within_radius[:n]
+    ]
+
+    return {
+        "nearby": results,
+        "category_scores": score_property(within_radius, lat, lon),
+    }
 
 
 @router.get("/health")
 async def poi_health():
-    return {"status": "ok", "total_pois": len(_poi_data)}
+    return {
+        "status": "ok",
+        "total_pois": len(_poi_data),
+        "ingest_auth": "enabled" if _expected_api_key() else "disabled",
+    }
