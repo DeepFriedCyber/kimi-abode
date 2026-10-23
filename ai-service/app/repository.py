@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date, datetime
 from typing import Any
 
 import asyncpg
@@ -41,6 +42,45 @@ def _vector_literal(embedding: Any) -> str | None:
     if isinstance(embedding, str):
         return embedding
     return "[" + ",".join(f"{float(value):.6f}" for value in embedding) + "]"
+
+
+def _as_date(value: Any) -> date | None:
+    """Coerce a DATE parameter.
+
+    Importers hand us ISO strings; asyncpg requires a date object for a DATE
+    column. Unparseable values become NULL rather than failing the whole row.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            logger.warning("dropping unparseable date_sold %r", value)
+            return None
+    return None
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    """Coerce a TIMESTAMPTZ parameter from ISO text or a date."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning("dropping unparseable timestamp %r", value)
+            return None
+    return None
+
 
 
 def _escape_like(value: str) -> str:
@@ -88,7 +128,7 @@ async def upsert_property(pool: asyncpg.Pool, prop: dict[str, Any]) -> int:
             prop.get("town"), prop.get("postcode"),
             prop.get("outcode"), prop.get("property_type"),
             prop.get("num_beds"), prop.get("price_paid"),
-            prop.get("date_sold"), prop.get("latitude"),
+            _as_date(prop.get("date_sold")), prop.get("latitude"),
             prop.get("longitude"),
             prop.get("floor_area_sqm"), prop.get("plot_size_sqm"),
             prop.get("price_per_sqm"), prop.get("tenure"),
@@ -112,7 +152,7 @@ async def upsert_sale(pool: asyncpg.Pool, sale: dict[str, Any]) -> int:
             sql,
             sale["property_address"], sale.get("property_town"),
             sale.get("postcode"), sale["price_paid"],
-            sale.get("date_sold"), sale.get("property_type"),
+            _as_date(sale.get("date_sold")), sale.get("property_type"),
         )
     return int(row_id or 0)
 
@@ -175,14 +215,14 @@ async def upsert_listing(pool: asyncpg.Pool, listing: dict[str, Any]) -> int:
             listing.get("property_type"), listing.get("num_beds"),
             listing.get("num_bathrooms"), listing.get("asking_price"),
             listing.get("price_qualifier"), listing.get("price_period"),
-            listing.get("price_paid"), listing.get("date_sold"),
+            listing.get("price_paid"), _as_date(listing.get("date_sold")),
             listing.get("listing_status", "available"), listing.get("tenure"),
             listing.get("floor_area_sqm"), listing.get("plot_size_sqm"),
             listing.get("description"), json.dumps(listing.get("features") or []),
             listing.get("latitude"), listing.get("longitude"),
             listing.get("ward"), listing.get("district"),
             listing.get("source"), listing.get("source_url"),
-            listing.get("listed_at"),
+            _as_datetime(listing.get("listed_at")),
         )
 
 
@@ -523,6 +563,39 @@ def photo_record_to_dict(row: asyncpg.Record) -> dict[str, Any]:
 async def fetch_listing_owner(pool: asyncpg.Pool, listing_id: int) -> str | None:
     async with pool.acquire() as conn:
         return await conn.fetchval("SELECT agent_id FROM listings WHERE id = $1", listing_id)
+
+
+async def list_agent_listings(
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    agent_id: str | None = None,
+) -> tuple[list[asyncpg.Record], int]:
+    """One page of agent listings for the management UI (newest first)."""
+    limit = max(1, min(int(limit), MAX_LIMIT))
+    offset = max(0, int(offset))
+    where_sql = "WHERE agent_id = $1" if agent_id else ""
+    count_params: list[Any] = [agent_id] if agent_id else []
+
+    params: list[Any] = list(count_params)
+    limit_index = len(params) + 1
+    params.append(limit)
+    offset_index = len(params) + 1
+    params.append(offset)
+
+    sql = (
+        f"SELECT {LISTING_COLUMNS} FROM listings {where_sql} "
+        f"ORDER BY listed_at DESC NULLS LAST, id DESC "
+        f"LIMIT ${limit_index} OFFSET ${offset_index}"
+    )
+    count_sql = f"SELECT count(*) FROM listings {where_sql}"
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+        total = await conn.fetchval(count_sql, *count_params)
+
+    return list(rows), int(total or 0)
 
 
 async def list_listing_photos(pool: asyncpg.Pool, listing_id: int) -> list[dict[str, Any]]:

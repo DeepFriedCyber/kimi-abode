@@ -58,3 +58,5 @@ ai-service/data/agent_listings.json
 *.osm.pbf
 ai-service/data/cache/
 ai-service/data/media/
+# Local PostgreSQL cluster created by scripts/dev-postgres.ps1
+.pgdata/

@@ -7,8 +7,9 @@ used as a parameter index), which made every vector search raise.
 from __future__ import annotations
 
 import pytest
+from datetime import date, datetime
 
-from app.repository import _build_where_clause, execute_search_pg
+from app.repository import _as_date, _as_datetime, _build_where_clause, execute_search_pg
 from app.schemas import ParsedQuery, PropertyType
 
 
@@ -224,3 +225,61 @@ class TestLiveListingSearch:
         count_sql, count_params = pool.connection.fetchval_calls[0]
         assert count_sql.startswith("SELECT count(*) FROM listings")
         assert count_params == (2,)
+
+
+class TestAgentListingPage:
+    @pytest.mark.asyncio
+    async def test_paginates_without_agent_filter(self):
+        from app.repository import list_agent_listings
+
+        pool = FakePool()
+        _, total = await list_agent_listings(pool, limit=10, offset=5)
+
+        sql, params = pool.connection.fetch_calls[0]
+        assert "FROM listings" in sql
+        assert "WHERE agent_id" not in sql
+        assert "LIMIT $1 OFFSET $2" in sql
+        assert params == (10, 5)
+        assert total == 7
+
+    @pytest.mark.asyncio
+    async def test_agent_filter_shifts_parameter_indexes(self):
+        from app.repository import list_agent_listings
+
+        pool = FakePool()
+        await list_agent_listings(pool, limit=25, offset=0, agent_id="agent-a")
+
+        sql, params = pool.connection.fetch_calls[0]
+        assert "WHERE agent_id = $1" in sql
+        assert "LIMIT $2 OFFSET $3" in sql
+        assert params == ("agent-a", 25, 0)
+        count_sql, count_params = pool.connection.fetchval_calls[0]
+        assert count_sql.startswith("SELECT count(*) FROM listings WHERE agent_id = $1")
+        assert count_params == ("agent-a",)
+
+
+class TestDateCoercion:
+    """asyncpg needs date/datetime objects; importers hand over ISO strings."""
+
+    def test_iso_string_becomes_date(self):
+        assert _as_date("2025-03-01") == date(2025, 3, 1)
+
+    def test_iso_datetime_is_truncated_to_date(self):
+        assert _as_date("2025-03-01T14:30:00") == date(2025, 3, 1)
+
+    def test_date_passes_through(self):
+        assert _as_date(date(2024, 12, 31)) == date(2024, 12, 31)
+
+    def test_unparseable_value_becomes_null(self):
+        assert _as_date("sometime last spring") is None
+
+    def test_none_stays_none(self):
+        assert _as_date(None) is None
+        assert _as_datetime(None) is None
+
+    def test_timestamp_accepts_z_suffix(self):
+        parsed = _as_datetime("2025-03-01T10:00:00Z")
+        assert parsed is not None and parsed.tzinfo is not None
+
+    def test_timestamp_from_plain_date(self):
+        assert _as_datetime("2025-03-01") == datetime(2025, 3, 1)

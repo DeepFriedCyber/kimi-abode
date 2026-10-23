@@ -6,6 +6,7 @@ the HTTP surface consumed by the gateway (Node) or directly by the frontend.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -112,6 +113,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     app.state.embedder = embedder
 
+    # Warm remote embedders so the first user search does not pay the model
+    # load. Ollama can take ~20s to load a model on a cold start.
+    if not isinstance(embedder, HashEmbedder):
+        async def _warm_embedder() -> None:
+            try:
+                await asyncio.wait_for(embedder.embed("warmup"), timeout=90)
+                logger.info("[Lifespan] Embedder warmed")
+            except Exception as exc:  # noqa: BLE001 - warmup is best effort
+                logger.warning("[Lifespan] Embedder warmup failed: %s", exc)
+
+        app.state.warmup_task = asyncio.create_task(_warm_embedder())
+
     # --- database pool -----------------------------------------------------
     app.state.pool = None
     if database_url := os.getenv("DATABASE_URL"):
@@ -176,6 +189,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     logger.info("[Lifespan] Shutting down")
+    warmup = getattr(app.state, "warmup_task", None)
+    if warmup is not None and not warmup.done():
+        warmup.cancel()
     if app.state.pool:
         try:
             await app.state.pool.close()
@@ -326,7 +342,7 @@ def _coerce_property_types(values: list[str] | None) -> list[PropertyType]:
 
 @app.get("/search")
 async def search_endpoint(
-    query: str = Query(min_length=1, max_length=500),
+    query: str = Query(default="", max_length=500),
     min_beds: int | None = Query(default=None, ge=0, le=20),
     max_beds: int | None = Query(default=None, ge=0, le=20),
     max_price: float | None = Query(default=None, ge=0, le=50_000_000),
@@ -508,6 +524,8 @@ async def property_endpoint(id: int = Query(ge=1)):
         except Exception as exc:  # noqa: BLE001 - photos are optional
             logger.warning("[Property] could not attach photos: %s", exc)
 
+    # Sold records have no photos; keep the response shape stable regardless.
+    record.setdefault("photos", [])
     return record
 
 

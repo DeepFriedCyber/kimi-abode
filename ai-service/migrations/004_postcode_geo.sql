@@ -1,4 +1,7 @@
--- Migration 004: Postcode geo data for town enrichment
+-- Migration 004: Postcode geo data for town enrichment -- ll_to_earth() comes from earthdistance, which depends on cube.
+
+CREATE EXTENSION IF NOT EXISTS cube;
+CREATE EXTENSION IF NOT EXISTS earthdistance;
 
 CREATE TABLE IF NOT EXISTS postcode_geo (
     id          SERIAL PRIMARY KEY,

@@ -134,6 +134,17 @@ class TestApiSmoke:
         response = client.get("/search", params={"query": "house", "min_beds": 5, "max_beds": 2})
         assert response.status_code == 400
 
+    def test_search_accepts_filters_without_a_query(self, client):
+        # A filter-only browse is legitimate: the UI chips send no free text.
+        response = client.get("/search", params={"location": "Sandbach", "min_beds": 3})
+        assert response.status_code == 200
+        assert response.json()["properties"]
+
+    def test_property_always_includes_a_photos_list(self, client):
+        # Sold records have no photos, but the response shape must not change.
+        body = client.get("/property", params={"id": 1}).json()
+        assert body["photos"] == []
+
     def test_property_served_from_fixture_without_database(self, client):
         response = client.get("/property", params={"id": 1})
         assert response.status_code == 200

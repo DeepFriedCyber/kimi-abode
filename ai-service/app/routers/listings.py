@@ -292,7 +292,25 @@ async def list_listings(
             raise HTTPException(status_code=403, detail="Cannot list another agent's listings")
         agent_id = caller
 
-    return listing_store.list(limit=limit, offset=offset, agent_id=agent_id)
+    pool = getattr(request.app.state, "pool", None)
+    if pool is None:
+        return listing_store.list(limit=limit, offset=offset, agent_id=agent_id)
+
+    # Postgres is the source of truth when configured; the JSON store is only a
+    # no-database fallback, and the two must not diverge (photos used to 404
+    # because this endpoint still read the JSON store while uploads went to SQL).
+    from ..repository import list_agent_listings, list_photos_for_listings
+
+    rows, total = await list_agent_listings(
+        pool, limit=limit, offset=offset, agent_id=agent_id
+    )
+    listings = [dict(row) for row in rows]
+    if listings:
+        photos = await list_photos_for_listings(pool, [item["id"] for item in listings])
+        for item in listings:
+            item["photos"] = photos.get(item["id"], [])
+
+    return {"total": total, "limit": limit, "offset": offset, "listings": listings}
 
 
 @router.get("/import/columns")

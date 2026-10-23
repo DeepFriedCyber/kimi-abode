@@ -68,6 +68,28 @@ End-to-end smoke (starts both services, exercises the gateway):
 powershell -ExecutionPolicy Bypass -File scripts/e2e-smoke.ps1
 ```
 
+## Running on PostgreSQL
+
+Without Docker (a local PostgreSQL 17/18 install is fine — pgvector must be
+available to that installation):
+
+```powershell
+powershell -File scripts/dev-postgres.ps1 init      # cluster in .pgdata, port 5544
+powershell -File scripts/dev-postgres.ps1 start
+powershell -File scripts/dev-postgres.ps1 migrate   # 001..007, extension check
+$env:DATABASE_URL = "postgresql://abode:<POSTGRES_PASSWORD from .env>@127.0.0.1:5544/abode"
+python scripts/load_demo_to_postgres.py             # 500 rows, idempotent
+python scripts/pg_smoke.py                          # 21 checks through the API
+```
+
+`dev-postgres.ps1` uses the password in `.env` so the connection string matches
+deployment config; `reset` drops the cluster. With Docker, `docker compose up -d`
+does the same job on port 5432, and the migrations mount as initdb scripts.
+
+`pg_smoke.py` covers what the unit tests only assert against fakes: SQL search
+with filters, the live/sold union, property detail, the photo joins and the POI
+endpoint. Run it after any repository change.
+
 ## Demo dataset (500 historical sales)
 
 `search_results(4).csv` is imported into `ai-service/data/demo_listings.json`

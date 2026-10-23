@@ -96,9 +96,11 @@ try {
   $listingPage = Invoke-RestMethod -Uri "http://127.0.0.1:3001/api/listings?limit=5" -TimeoutSec 10
   Record "listings-list" "total=$($listingPage.total)"
 
-  # Listing photos (multipart, processed to WebP, EXIF stripped)
+  # Listing photos (multipart, processed to WebP, EXIF stripped).
+  # A random colour gives a unique content hash, so "added" is meaningful on
+  # a database that survives between runs.
   $imagePath = Join-Path $env:TEMP "e2e-photo.jpg"
-  python -c "from PIL import Image; Image.new('RGB', (900, 600), (30, 120, 200)).save(r'$imagePath', 'JPEG')"
+  python -c "import random; from PIL import Image; Image.new('RGB', (900, 600), tuple(random.randrange(256) for _ in range(3))).save(r'$imagePath', 'JPEG')"
   $listingId = ($listingPage.listings | Where-Object { $_.address_line1 -eq "99 Demo Upload Road" } | Select-Object -First 1).id
 
   $photoUpload = & curl.exe -sS -m 60 -X POST "http://127.0.0.1:3001/api/listings/$listingId/photos" `
@@ -121,7 +123,7 @@ try {
   Record "area-supermarket" "answer=$($supermarket.answer) results=$($supermarket.results.Count)"
 
   $tesco = Invoke-RestMethod -Uri "http://127.0.0.1:3001/api/property/1/nearby?q=how%20far%20is%20the%20nearest%20Tesco%3F" -TimeoutSec 20
-  Record "area-brand" "brand=$($tesco.intent.brand) first=$($tesco.results[0].name) dist=$($tesco.results[0].distance_m)m"
+  Record "area-brand" "brand=$($tesco.intent.brand) first=$($tesco.results[0].name) dist=$($tesco.results[0].distance_m)m fallback=$([bool]$tesco.fallback)"
 
   $gyms = Invoke-RestMethod -Uri "http://127.0.0.1:3001/api/property/1/nearby?q=what%20gyms%20are%20nearby%3F" -TimeoutSec 20
   $gymCategories = ($gyms.results | ForEach-Object { $_.category } | Sort-Object -Unique) -join ","
