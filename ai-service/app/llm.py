@@ -7,6 +7,21 @@ from typing import Optional
 
 EMBEDDING_DIM = 768
 
+PLACEHOLDER_PREFIXES = ("your", "sk-proj-xxx", "changeme")
+
+
+def is_placeholder_secret(value: str | None) -> bool:
+    """True for empty values and the dotted placeholders shipped in .env.example.
+
+    A real key that happens to contain "xxxx" would be rejected too, which is
+    the safe direction: better to fall back to a local embedder than to send
+    requests with a broken credential.
+    """
+    lowered = (value or "").strip().lower()
+    if not lowered:
+        return True
+    return "xxxx" in lowered or lowered.startswith(PLACEHOLDER_PREFIXES)
+
 
 class Embedder:
     """Base embedding interface."""

@@ -60,3 +60,5 @@ ai-service/data/cache/
 ai-service/data/media/
 # Local PostgreSQL cluster created by scripts/dev-postgres.ps1
 .pgdata/
+# Eval harness output
+eval_*.json

@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .cache import InMemorySemanticCache
 from .chat.service import AnthropicChatLLM, ChatFallbackLLM, ChatService
-from .llm import HashEmbedder, OllamaEmbedder, OpenAIEmbedder
+from .llm import HashEmbedder, OllamaEmbedder, OpenAIEmbedder, is_placeholder_secret
 from .media import ensure_media_root, is_safe_media_path
 from .router import DeterministicSearchProvider, QueryRouter, build_providers, demo_data_enabled
 from .schemas import ParsedQuery, ParseRequest, PropertyType
@@ -73,8 +73,7 @@ def _secret(name: str) -> str:
     if not value:
         return ""
 
-    lowered = value.lower()
-    if "xxxx" in lowered or lowered.startswith(("your", "sk-proj-xxx", "changeme")):
+    if is_placeholder_secret(value):
         logger.warning("[Config] %s looks like a placeholder — ignoring it", name)
         return ""
 

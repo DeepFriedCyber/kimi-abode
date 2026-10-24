@@ -294,10 +294,36 @@ async def execute_search_pg(
     where_sql, filter_params = _build_where_clause(parsed, district)
     params: list[Any] = list(filter_params)
 
+    # Hybrid ranking: vector similarity for meaning, ts_rank for the words the
+    # user actually typed. The expression covers address, town and postcode so
+    # "51 Cloverfields CW1 5AL" matches every token the user supplied.
+    text_expression = (
+        "to_tsvector('english', coalesce(address_line1, '') || ' ' || "
+        "coalesce(town, '') || ' ' || coalesce(postcode, ''))"
+    )
+    rank_parts: list[str] = []
+
     if embedding:
         embedding_index = len(params) + 1
         params.append(_vector_literal(embedding))
-        order_by = f"ORDER BY embedding <=> ${embedding_index}::vector"
+        rank_parts.append(
+            f"0.65 * (1 - coalesce(embedding <=> ${embedding_index}::vector, 1.0))"
+        )
+
+    query_text = (message or "").strip()
+    if query_text:
+        text_index = len(params) + 1
+        params.append(query_text)
+        # ts_rank for a three-term address match is ~0.27, an order of magnitude
+        # below a cosine similarity. Scaling (and capping) makes the weights
+        # mean what they say: a full text match scores 1.0.
+        rank_parts.append(
+            f"0.35 * least(4 * ts_rank({text_expression}, "
+            f"plainto_tsquery('english', ${text_index})), 1.0)"
+        )
+
+    if rank_parts:
+        order_by = "ORDER BY (" + " + ".join(rank_parts) + ") DESC, id ASC"
     else:
         order_by = "ORDER BY id"
 

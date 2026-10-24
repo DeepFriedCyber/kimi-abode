@@ -88,8 +88,9 @@ class TestExecuteSearchPg:
         await execute_search_pg(pool, query(), "test", None, limit=10, offset=20)
 
         sql, params = pool.connection.fetch_calls[0]
-        assert "LIMIT $1 OFFSET $2" in sql
-        assert params == (10, 20)
+        # $1 is the free-text rank parameter, then pagination.
+        assert "LIMIT $2 OFFSET $3" in sql
+        assert params == ("test", 10, 20)
 
     @pytest.mark.asyncio
     async def test_filters_shift_limit_indexes_correctly(self):
@@ -101,8 +102,8 @@ class TestExecuteSearchPg:
         sql, params = pool.connection.fetch_calls[0]
         assert "num_beds >= $1" in sql
         assert "town ILIKE $2" in sql
-        assert "LIMIT $3 OFFSET $4" in sql
-        assert params == (3, "%Sandbach%", 25, 0)
+        assert "LIMIT $4 OFFSET $5" in sql
+        assert params == (3, "%Sandbach%", "test", 25, 0)
 
     @pytest.mark.asyncio
     async def test_embedding_parameter_is_after_filters(self):
@@ -113,8 +114,31 @@ class TestExecuteSearchPg:
 
         sql, params = pool.connection.fetch_calls[0]
         assert "embedding <=> $2::vector" in sql
-        assert "LIMIT $3 OFFSET $4" in sql
+        assert "LIMIT $4 OFFSET $5" in sql
         assert params[1].startswith("[0.100000,0.200000,0.300000]")
+        assert params[2] == "test"
+
+    @pytest.mark.asyncio
+    async def test_text_rank_is_part_of_the_ordering(self):
+        pool = FakePool()
+        await execute_search_pg(pool, query(), "51 Cloverfields", None, limit=5)
+
+        sql, params = pool.connection.fetch_calls[0]
+        assert "ts_rank(" in sql
+        assert "plainto_tsquery('english', $1)" in sql
+        assert "ORDER BY" in sql and "DESC, id ASC" in sql
+        assert params == ("51 Cloverfields", 5, 0)
+
+    @pytest.mark.asyncio
+    async def test_hybrid_combines_vector_and_text_scores(self):
+        pool = FakePool()
+        await execute_search_pg(pool, query(), "3 bed in Sandbach", [0.1, 0.2], limit=5)
+
+        sql, params = pool.connection.fetch_calls[0]
+        assert "0.65 * (1 - coalesce(embedding <=> $1::vector, 1.0))" in sql
+        assert "0.35 * least(4 * ts_rank(" in sql
+        assert "plainto_tsquery('english', $2)" in sql
+        assert params[2:] == (5, 0)
 
     @pytest.mark.asyncio
     async def test_total_comes_from_count_not_page_length(self):

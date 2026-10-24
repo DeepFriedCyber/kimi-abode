@@ -90,6 +90,53 @@ does the same job on port 5432, and the migrations mount as initdb scripts.
 with filters, the live/sold union, property detail, the photo joins and the POI
 endpoint. Run it after any repository change.
 
+Embeddings and search quality:
+
+```bash
+python scripts/embed_properties.py       # backfill vectors (Ollama/OpenAI, resumable)
+python scripts/eval_search.py            # 30 labelled queries, precision/recall/MRR
+```
+
+## Search quality (eval harness)
+
+`scripts/eval_search.py` runs 30 labelled queries through the same API the UI
+uses. Ground truth is computed in SQL from each case's constraints, so the
+harness checks the parser and the ranker rather than trusting them.
+
+| Metric | Before the fixes | Now |
+|---|---|---|
+| Constraint precision@10 | 0.74 | **1.00** |
+| Constraint recall@10 | 0.75 | **1.00** |
+| Address MRR | 0.07 | **1.00** |
+| Empty-result correctness | 0.67 | **1.00** |
+| Latency p50 / p95 | 46 ms / 75 ms | 46 ms / 50 ms |
+
+What the first run exposed, and what fixed it:
+
+- **Outcodes were parsed as town names.** `"detached in CW11"` became
+  `town ILIKE '%Cw11%'` and returned nothing. A standalone outcode is now an
+  outcode filter; the outcode→town inference was removed because an outcode
+  spans several towns (CW1 covers Crewe *and* Haslington, which was excluding
+  the exact property being searched for).
+- **`"2 bed"` meant "2 or more".** It now means exactly two, as on the portals;
+  `"2+ bed"` and `"at least 2 bed"` stay minimums.
+- **Price ranges did not parse.** `"between 150k and 250k"` produced no filters
+  at all; ranges are now extracted, and a missing preposition no longer drops
+  the town (`"Crewe between ..."`).
+- **Plural nouns were ignored** (`bungalows`, `maisonettes`), and `"semi"` on its
+  own was not a type.
+- **Nothing ranked text.** Address queries returned rows in id order. Search now
+  sums a vector score with `ts_rank` over address, town and postcode, scaled so
+  a full text match counts as much as a good cosine similarity.
+- **Listings and sold properties shared the id space**, so `/property/1` could
+  return an agent upload instead of the sold record with that id. Listings now
+  start at 1,000,001 (migration 008), matching the JSON store's 900,001.
+
+What this dataset cannot measure: the sold-price rows carry no description, so
+"semantic" ranking here is structure plus address text. Descriptions arrive with
+agent uploads — that is where vector search has something to work with.
+
+
 ## Demo dataset (500 historical sales)
 
 `search_results(4).csv` is imported into `ai-service/data/demo_listings.json`

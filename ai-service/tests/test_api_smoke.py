@@ -38,10 +38,18 @@ class TestParserEdges:
         result = _deterministic_parse("under £5")
         assert result.max_price is None
 
-    def test_outcode_falls_back_to_gazetteer(self):
+    def test_outcode_is_a_filter_not_a_town(self):
+        # CW11 covers Sandbach and surrounding villages; deriving a town from
+        # the outcode and filtering on it excluded valid properties (CW1 covers
+        # both Crewe and Haslington, which broke an address search).
         result = _deterministic_parse("3 bed CW11 1JD")
         assert result.outcode == "CW11"
-        assert result.location == "Sandbach"
+        assert result.location is None
+        assert (result.min_beds, result.max_beds) == (3, 3)
+
+    def test_plus_sign_means_minimum_beds(self):
+        result = _deterministic_parse("2+ bed in Crewe")
+        assert (result.min_beds, result.max_beds) == (2, None)
 
     def test_semi_detached_is_not_also_detached(self):
         result = _deterministic_parse("semi-detached house")

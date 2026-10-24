@@ -16,7 +16,8 @@ from .schemas import ParsedQuery, PropertyType
 BED_RANGE_PATTERN = re.compile(
     r"\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s*-?\s*bed(?:room)?s?\b", re.I
 )
-BED_PATTERN = re.compile(r"\b(\d{1,2})\s*-?\s*bed(?:room)?s?\b", re.I)
+BED_PATTERN = re.compile(r"\b(\d{1,2})\s*\+?\s*-?\s*bed(?:room)?s?\b", re.I)
+MIN_BED_PATTERN = re.compile(r"\d\s*\+|\bat\s+least\b|\bover\b|\bminimum\b|\bplus\b", re.I)
 
 # "under £250k", "up to 300,000", "budget of £1.2m"
 PRICE_PATTERN = re.compile(
@@ -50,14 +51,28 @@ NON_LOCATION_WORDS = {
 # ---------- Type patterns (compound matches are listed first) -------------
 TYPE_PATTERNS: list[tuple[re.Pattern[str], PropertyType]] = [
     (re.compile(r"semi[-\s]?detached", re.I), PropertyType.SEMI_DETACHED),
+    (re.compile(r"\bsemi\b", re.I), PropertyType.SEMI_DETACHED),
     (re.compile(r"maisonette", re.I), PropertyType.MAISONETTE),
-    (re.compile(r"\bbungalow\b", re.I), PropertyType.BUNGALOW),
+    (re.compile(r"\bbungalows?\b", re.I), PropertyType.BUNGALOW),
     (re.compile(r"\bflats?\b|\bapartments?\b", re.I), PropertyType.FLAT),
     (re.compile(r"\bdetached\b", re.I), PropertyType.DETACHED),
     (re.compile(r"\bterraced\b|\bterrace\b", re.I), PropertyType.TERRACED),
 ]
 
-OUTCODE_PATTERN = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*\d[A-Z]{2}\b", re.I)
+FULL_POSTCODE_PATTERN = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*\d[A-Z]{2}\b", re.I)
+OUTCODE_PATTERN = FULL_POSTCODE_PATTERN
+# A standalone outcode ("CW11", "in ST7"). Case-insensitive, then validated.
+BARE_OUTCODE_PATTERN = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?)\b", re.I)
+LOCATION_TAIL_PATTERN = re.compile(
+    r"\b(?:in|near|around|within|close\s+to)\s+(?:the\s+)?$", re.I
+)
+
+# "between 150k and 250k", "from 150000 to 250000", "150000-250000"
+PRICE_RANGE_PATTERN = re.compile(
+    r"(?:between\s+|from\s+)?£?\s*([\d][\d,]*(?:\.\d+)?)\s*([kKmM])?"
+    r"\s*(?:-|–|to|and)\s*£?\s*([\d][\d,]*(?:\.\d+)?)\s*([kKmM])?",
+    re.I,
+)
 
 MIN_PRICE = 1_000
 MAX_PRICE = 50_000_000
@@ -112,13 +127,25 @@ def _extract_beds(query: str) -> tuple[int | None, int | None]:
     if single:
         value = int(single.group(1))
         if 0 <= value <= MAX_BEDS:
-            return value, None
+            # "2 bed" means exactly two, as it does on the portals. "2+ bed"
+            # or "at least 2 bed" is a floor, not an exact count.
+            if MIN_BED_PATTERN.search(query):
+                return value, None
+            return value, value
 
     return None, None
 
 
 def _extract_price(query: str) -> tuple[float | None, float | None, bool]:
     """Return (min_price, max_price, has_price)."""
+    range_match = PRICE_RANGE_PATTERN.search(query)
+    if range_match and not _inside_span(range_match.start(), _bed_spans(query)):
+        low = _parse_number(range_match.group(1), range_match.group(2))
+        high = _parse_number(range_match.group(3), range_match.group(4))
+        low, high = min(low, high), max(low, high)
+        if _plausible_price(low) and _plausible_price(high):
+            return low, high, True
+
     match = PRICE_PATTERN.search(query)
     if not match:
         bare = BARE_PRICE_PATTERN.search(query)
@@ -151,6 +178,31 @@ def _extract_types(query: str) -> list[PropertyType]:
             break  # one match per pattern is enough
 
     return found
+
+
+def _bed_spans(query: str) -> list[tuple[int, int]]:
+    return [match.span() for match in (BED_RANGE_PATTERN, BED_PATTERN) for match in match.finditer(query)]
+
+
+def _extract_outcode(query: str) -> str | None:
+    """Return an outcode from a full postcode or a standalone token.
+
+    "in CW11" is a postcode search, not a town called Cw11. A lowercase token
+    is only accepted straight after a location keyword, so ordinary words and
+    model numbers do not become filters.
+    """
+    full = FULL_POSTCODE_PATTERN.search(query)
+    if full:
+        return full.group(1).upper()
+
+    excluded = _excluded_spans(query)
+    for match in BARE_OUTCODE_PATTERN.finditer(query):
+        if _inside_span(match.start(), excluded):
+            continue
+        token = match.group(1)
+        if token.isupper() or LOCATION_TAIL_PATTERN.search(query[: match.start()]):
+            return token.upper()
+    return None
 
 
 def _excluded_spans(query: str) -> list[tuple[int, int]]:
@@ -218,17 +270,27 @@ def _deterministic_parse(query: str) -> ParsedQuery:
 
     location = _extract_location(query)
     district = None
-    outcode = None
+    outcode = _extract_outcode(query)
 
-    postcode_match = OUTCODE_PATTERN.search(query)
-    if postcode_match:
-        outcode = postcode_match.group(1).upper()
-        if not location:
-            from .gazetteer import outcode_to_town
+    # "in CW11" yields candidate "Cw11" from the keyword scan; that is a
+    # postcode, not a town, and filtering town ILIKE '%Cw11%' matches nothing.
+    if location and outcode and location.replace(" ", "").upper() == outcode:
+        location = None
+    if location and re.fullmatch(r"[A-Za-z]{1,2}\d[A-Za-z\d]?", location.replace(" ", "")):
+        location = None
 
-            town = outcode_to_town(outcode)
-            if town:
-                location = town
+    # Deliberately no outcode -> town inference: an outcode spans several towns
+    # (CW1 covers both Crewe and Haslington), so adding a town filter would
+    # exclude the property the user asked for.
+
+    if not location and not outcode:
+        # "Crewe between 150k and 250k" has no preposition; fall back to a
+        # gazetteer scan so the town is not silently dropped.
+        from .gazetteer import match_towns
+
+        towns = match_towns(query)
+        if towns:
+            location = max(towns, key=len)
 
     return ParsedQuery(
         raw=query,
